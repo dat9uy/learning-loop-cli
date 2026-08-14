@@ -9,6 +9,7 @@ import (
 	"github.com/dat9uy/learning-loop-cli/internal/codex"
 	conformancecodex "github.com/dat9uy/learning-loop-cli/internal/conformance/codex"
 	"github.com/dat9uy/learning-loop-cli/internal/harness"
+	"github.com/dat9uy/learning-loop-cli/internal/opencode"
 	"github.com/dat9uy/learning-loop-cli/internal/recordstore"
 	"github.com/dat9uy/learning-loop-cli/internal/render"
 	"github.com/dat9uy/learning-loop-cli/internal/runtimecache"
@@ -21,6 +22,8 @@ Usage:
   learning-loop render <project-root>            render current Rules as Instruction Markdown
   learning-loop connect codex <project-root>     connect the project to Codex
   learning-loop disconnect codex <project-root> disconnect the project from Codex
+  learning-loop connect opencode <project-root>  connect the project to OpenCode
+  learning-loop disconnect opencode <project-root> disconnect the project from OpenCode
   learning-loop codex-adapter                    Codex SessionStart hook adapter (reads stdin)
   learning-loop runtime-setup codex              download the pinned Codex CLI into the Runtime cache
   learning-loop conformance codex [--keep]       run the Codex real-Runtime conformance case
@@ -46,17 +49,33 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return runRender(args[1], stdout, stderr)
 	case "connect":
-		if len(args) != 3 || args[1] != "codex" {
+		if len(args) != 3 {
 			usageError(stderr)
 			return 2
 		}
-		return runConnectCodex(args[2], stdout, stderr)
+		switch args[1] {
+		case "codex":
+			return runConnectCodex(args[2], stdout, stderr)
+		case "opencode":
+			return runConnectOpenCode(args[2], stdout, stderr)
+		default:
+			usageError(stderr)
+			return 2
+		}
 	case "disconnect":
-		if len(args) != 3 || args[1] != "codex" {
+		if len(args) != 3 {
 			usageError(stderr)
 			return 2
 		}
-		return runDisconnectCodex(args[2], stdout, stderr)
+		switch args[1] {
+		case "codex":
+			return runDisconnectCodex(args[2], stdout, stderr)
+		case "opencode":
+			return runDisconnectOpenCode(args[2], stdout, stderr)
+		default:
+			usageError(stderr)
+			return 2
+		}
 	case "codex-adapter":
 		if len(args) != 1 {
 			usageError(stderr)
@@ -136,6 +155,30 @@ func runDisconnectCodex(root string, stdout, stderr io.Writer) int {
 	messages, err := codex.New().Uninstall(root)
 	if err != nil {
 		fmt.Fprintf(stderr, "learning-loop: disconnect codex: %v\n", err)
+		return 1
+	}
+	for _, m := range messages {
+		fmt.Fprintln(stdout, m)
+	}
+	return 0
+}
+
+func runConnectOpenCode(root string, stdout, stderr io.Writer) int {
+	messages, err := opencode.New().Install(root)
+	if err != nil {
+		fmt.Fprintf(stderr, "learning-loop: connect opencode: %v\n", err)
+		return 1
+	}
+	for _, m := range messages {
+		fmt.Fprintln(stdout, m)
+	}
+	return 0
+}
+
+func runDisconnectOpenCode(root string, stdout, stderr io.Writer) int {
+	messages, err := opencode.New().Uninstall(root)
+	if err != nil {
+		fmt.Fprintf(stderr, "learning-loop: disconnect opencode: %v\n", err)
 		return 1
 	}
 	for _, m := range messages {
