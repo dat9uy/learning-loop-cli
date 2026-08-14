@@ -183,7 +183,7 @@ func TestRenderRequiresAbsoluteRoot(t *testing.T) {
 }
 
 func TestUsageErrors(t *testing.T) {
-	for _, args := range [][]string{nil, {"bogus"}, {"render"}, {"init"}, {"connect"}, {"connect", "opencode", "/tmp/x"}, {"disconnect"}, {"disconnect", "opencode", "/tmp/x"}, {"codex-adapter", "extra"}} {
+	for _, args := range [][]string{nil, {"bogus"}, {"render"}, {"init"}, {"connect"}, {"connect", "unknown", "/tmp/x"}, {"disconnect"}, {"disconnect", "unknown", "/tmp/x"}, {"codex-adapter", "extra"}} {
 		code, stdout, stderr := run(t, args...)
 		if code == 0 {
 			t.Fatalf("args %v: exit code = 0, want nonzero", args)
@@ -233,6 +233,87 @@ func TestConnectCodexCreatesHook(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "learning-loop codex-adapter") {
 		t.Fatalf("hooks.json = %q, want learning-loop handler", data)
+	}
+}
+
+func fakeOpenCodePathEnv(t *testing.T, version string) string {
+	t.Helper()
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable: %v", err)
+	}
+	if err := os.Symlink(exe, filepath.Join(dir, "learning-loop")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	script := filepath.Join(dir, "opencode")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho opencode "+version+"\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return dir
+}
+
+func TestConnectOpenCodeCreatesPlugin(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", fakeOpenCodePathEnv(t, "1.18.18")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	code, stdout, stderr := run(t, "connect", "opencode", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "connected OpenCode to "+root) {
+		t.Fatalf("stdout = %q, want connection confirmation", stdout)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".opencode", "plugins", "learning-loop.js"))
+	if err != nil {
+		t.Fatalf("learning-loop.js: %v", err)
+	}
+	if !strings.Contains(string(data), `"experimental.chat.system.transform"`) {
+		t.Fatalf("learning-loop.js = %q, want native system transform hook", data)
+	}
+}
+
+func TestConnectOpenCodeWarnsForDifferentVersion(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", fakeOpenCodePathEnv(t, "1.19.0")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	code, stdout, stderr := run(t, "connect", "opencode", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "warning: OpenCode 1.19.0 is not the validated 1.18.18") {
+		t.Fatalf("stdout = %q, want version warning", stdout)
+	}
+}
+
+func TestConnectOpenCodePathMismatchFails(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	code, stdout, stderr := run(t, "connect", "opencode", root)
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "E201") {
+		t.Fatalf("stderr = %q, want stable code E201", stderr)
+	}
+}
+
+func TestDisconnectOpenCodeRemovesPlugin(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", fakeOpenCodePathEnv(t, "1.18.18")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if code, _, stderr := run(t, "connect", "opencode", root); code != 0 {
+		t.Fatalf("connect exit code = %d (stderr: %s)", code, stderr)
+	}
+	code, stdout, stderr := run(t, "disconnect", "opencode", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "disconnected OpenCode from "+root) {
+		t.Fatalf("stdout = %q, want disconnection confirmation", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".opencode", "plugins", "learning-loop.js")); !os.IsNotExist(err) {
+		t.Fatalf("learning-loop.js still exists")
 	}
 }
 
