@@ -13,9 +13,12 @@ import (
 // stubCase is a minimal Case for exercising the shared harness.
 type stubCase struct{}
 
-func (stubCase) Name() string          { return "stub" }
-func (stubCase) PinnedRuntime() string { return "stub 0.0.0" }
-func (stubCase) Installer() Installer  { return nil }
+func (stubCase) Name() string             { return "stub" }
+func (stubCase) PinnedRuntime() string    { return "stub 0.0.0" }
+func (stubCase) Installer() Installer     { return nil }
+func (stubCase) Configure(*Env) error     { return nil }
+func (stubCase) ModelRequestPath() string { return "/v1/responses" }
+func (stubCase) Completion() string       { return testCompletion }
 func (stubCase) Launch(context.Context, *Env) (LaunchResult, error) {
 	return LaunchResult{ExitCode: 0}, nil
 }
@@ -67,12 +70,16 @@ func TestPrepareCreatesDisposableEnvironment(t *testing.T) {
 	if !strings.Contains(env.Path(), env.BinDir) || !strings.Contains(env.Path(), "/nonexistent") {
 		t.Fatalf("Path = %q, want BinDir and RuntimeDir", env.Path())
 	}
-	config, err := os.ReadFile(filepath.Join(env.RuntimeHome, "config.toml"))
+}
+
+func TestPrepareInvokesCaseConfiguration(t *testing.T) {
+	env, err := Prepare(stubCase{}, Options{RuntimeDir: "/nonexistent"})
 	if err != nil {
-		t.Fatalf("runtime config.toml: %v", err)
+		t.Fatalf("prepare: %v", err)
 	}
-	if !strings.Contains(string(config), "trust_level = \"trusted\"") {
-		t.Fatalf("config.toml = %q, want the disposable project marked trusted", config)
+	defer os.RemoveAll(env.WorkDir)
+	if _, err := os.Stat(filepath.Join(env.RuntimeHome, "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("stub case's Configure must not write anything")
 	}
 }
 

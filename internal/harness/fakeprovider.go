@@ -2,8 +2,8 @@
 // prepares a disposable project and isolated Runtime environment, invokes
 // the production Installer, launches a real pinned Runtime against a
 // loopback fake model provider, and asserts on the first outbound request.
-// The OpenCode case reuses this package; Codex-specific launch and request
-// decoding live in the conformance cases.
+// Each conformance case owns its native launch, test-only configuration,
+// streaming response shape, and request decoding.
 package harness
 
 import (
@@ -22,18 +22,21 @@ type Request struct {
 }
 
 // FakeProvider is a loopback fake model provider. It captures outbound
-// requests and returns a valid canned streaming completion so the real
-// Runtime exits successfully. It never uses credentials, model cost, or a
-// real LLM.
+// requests and returns the case's valid canned streaming completion so the
+// real Runtime exits successfully. It never uses credentials, model cost,
+// or a real LLM.
 type FakeProvider struct {
-	server   *httptest.Server
-	mu       sync.Mutex
-	requests []Request
+	server     *httptest.Server
+	mu         sync.Mutex
+	requests   []Request
+	modelPath  string
+	completion string
 }
 
-// NewFakeProvider starts a loopback fake provider on 127.0.0.1.
-func NewFakeProvider() *FakeProvider {
-	p := &FakeProvider{}
+// NewFakeProvider starts a loopback fake provider on 127.0.0.1 serving the
+// given canned streaming completion at the given model request path.
+func NewFakeProvider(modelPath, completion string) *FakeProvider {
+	p := &FakeProvider{modelPath: modelPath, completion: completion}
 	p.server = httptest.NewServer(http.HandlerFunc(p.handle))
 	return p
 }
@@ -55,12 +58,12 @@ func (p *FakeProvider) Requests() []Request {
 	return append([]Request(nil), p.requests...)
 }
 
-// ResponsesRequests returns the captured model requests, i.e. the requests
-// that are not provider metadata probes.
-func (p *FakeProvider) ResponsesRequests() []Request {
+// ModelRequests returns the captured model requests, i.e. the requests that
+// are not provider metadata probes.
+func (p *FakeProvider) ModelRequests() []Request {
 	var out []Request
 	for _, r := range p.Requests() {
-		if r.Method == http.MethodPost && r.Path == "/v1/responses" {
+		if r.Method == http.MethodPost && r.Path == p.modelPath {
 			out = append(out, r)
 		}
 	}
@@ -76,24 +79,10 @@ func (p *FakeProvider) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"models":[]}`)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
+	case r.Method == http.MethodPost && r.URL.Path == p.modelPath:
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, cannedCompletion)
+		fmt.Fprint(w, p.completion)
 	default:
 		http.NotFound(w, r)
 	}
 }
-
-// cannedCompletion is a valid Responses API streaming completion: a created
-// response, one assistant output item, and a completed response. It mirrors
-// the event shape the pinned Codex CLI's own test suite serves.
-const cannedCompletion = `event: response.created
-data: {"type":"response.created","response":{"id":"response_1"}}
-
-event: response.output_item.done
-data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","id":"response_1","content":[{"type":"output_text","text":"done"}]}}
-
-event: response.completed
-data: {"type":"response.completed","response":{"id":"response_1","usage":{"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}}}
-
-`

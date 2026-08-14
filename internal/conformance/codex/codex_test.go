@@ -84,6 +84,25 @@ func TestDecodedRequestPassesSharedAssertions(t *testing.T) {
 	}
 }
 
+func TestConfigureMarksDisposableProjectTrusted(t *testing.T) {
+	env, err := harness.Prepare(New("/nonexistent"), harness.Options{RuntimeDir: "/nonexistent"})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer os.RemoveAll(env.WorkDir)
+
+	if err := (Case{}).Configure(env); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	config, err := os.ReadFile(filepath.Join(env.RuntimeHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("config.toml: %v", err)
+	}
+	if !strings.Contains(string(config), "trust_level = \"trusted\"") {
+		t.Fatalf("config.toml = %q, want the disposable project marked trusted", config)
+	}
+}
+
 func TestLaunchUsesPinnedBinaryWithIsolatedEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	record := filepath.Join(dir, "args")

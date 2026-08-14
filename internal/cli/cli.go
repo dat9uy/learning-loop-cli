@@ -8,6 +8,7 @@ import (
 
 	"github.com/dat9uy/learning-loop-cli/internal/codex"
 	conformancecodex "github.com/dat9uy/learning-loop-cli/internal/conformance/codex"
+	conformanceopencode "github.com/dat9uy/learning-loop-cli/internal/conformance/opencode"
 	"github.com/dat9uy/learning-loop-cli/internal/harness"
 	"github.com/dat9uy/learning-loop-cli/internal/opencode"
 	"github.com/dat9uy/learning-loop-cli/internal/recordstore"
@@ -25,8 +26,8 @@ Usage:
   learning-loop connect opencode <project-root>  connect the project to OpenCode
   learning-loop disconnect opencode <project-root> disconnect the project from OpenCode
   learning-loop codex-adapter                    Codex SessionStart hook adapter (reads stdin)
-  learning-loop runtime-setup codex              download the pinned Codex CLI into the Runtime cache
-  learning-loop conformance codex [--keep]       run the Codex real-Runtime conformance case
+  learning-loop runtime-setup <codex|opencode>   download the pinned Runtime into the Runtime cache
+  learning-loop conformance <codex|opencode> [--keep]  run the real-Runtime conformance case
 `
 
 // Run executes the CLI and returns the process exit code.
@@ -83,13 +84,21 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return codex.RunAdapter(stdin, stdout, stderr)
 	case "runtime-setup":
-		if len(args) != 2 || args[1] != "codex" {
+		if len(args) != 2 {
 			usageError(stderr)
 			return 2
 		}
-		return runRuntimeSetupCodex(stdout, stderr)
+		switch args[1] {
+		case "codex":
+			return runRuntimeSetupCodex(stdout, stderr)
+		case "opencode":
+			return runRuntimeSetupOpenCode(stdout, stderr)
+		default:
+			usageError(stderr)
+			return 2
+		}
 	case "conformance":
-		if len(args) < 2 || args[1] != "codex" {
+		if len(args) < 2 {
 			usageError(stderr)
 			return 2
 		}
@@ -101,7 +110,15 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			}
 			keep = true
 		}
-		return runConformanceCodex(keep, stdout, stderr)
+		switch args[1] {
+		case "codex":
+			return runConformanceCodex(keep, stdout, stderr)
+		case "opencode":
+			return runConformanceOpenCode(keep, stdout, stderr)
+		default:
+			usageError(stderr)
+			return 2
+		}
 	default:
 		usageError(stderr)
 		return 2
@@ -188,33 +205,49 @@ func runDisconnectOpenCode(root string, stdout, stderr io.Writer) int {
 }
 
 func runRuntimeSetupCodex(stdout, stderr io.Writer) int {
-	if _, err := runtimecache.CodexBinaryPath(); err == nil {
-		fmt.Fprintf(stdout, "Codex %s already cached at %s\n", runtimecache.CodexVersion, codexCachePath())
+	return runRuntimeSetup("codex", "Codex", runtimecache.CodexVersion, runtimecache.CodexBinaryPath, runtimecache.SetupCodex, stdout, stderr)
+}
+
+func runRuntimeSetupOpenCode(stdout, stderr io.Writer) int {
+	return runRuntimeSetup("opencode", "OpenCode", runtimecache.OpenCodeVersion, runtimecache.OpenCodeBinaryPath, runtimecache.SetupOpenCode, stdout, stderr)
+}
+
+func runRuntimeSetup(name, display, version string, binaryPath func() (string, error), setup func() error, stdout, stderr io.Writer) int {
+	if _, err := binaryPath(); err == nil {
+		fmt.Fprintf(stdout, "%s %s already cached at %s\n", display, version, runtimeCachePath(name, version))
 		return 0
 	}
-	fmt.Fprintf(stdout, "downloading Codex %s into the Runtime cache...\n", runtimecache.CodexVersion)
-	if err := runtimecache.SetupCodex(); err != nil {
-		fmt.Fprintf(stderr, "learning-loop: runtime-setup codex: %v\n", err)
+	fmt.Fprintf(stdout, "downloading %s %s into the Runtime cache...\n", display, version)
+	if err := setup(); err != nil {
+		fmt.Fprintf(stderr, "learning-loop: runtime-setup %s: %v\n", name, err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "Codex %s cached at %s\n", runtimecache.CodexVersion, codexCachePath())
+	fmt.Fprintf(stdout, "%s %s cached at %s\n", display, version, runtimeCachePath(name, version))
 	return 0
 }
 
-func codexCachePath() string {
+func runtimeCachePath(name, version string) string {
 	dir, err := runtimecache.CacheDir()
 	if err != nil {
 		return "<unresolved cache>"
 	}
-	return filepath.Join(dir, "codex-"+runtimecache.CodexVersion)
+	return filepath.Join(dir, name+"-"+version)
 }
 
 func runConformanceCodex(keep bool, stdout, stderr io.Writer) int {
-	bin, err := runtimecache.CodexBinaryPath()
+	return runConformance("codex", runtimecache.CodexBinaryPath, conformancecodex.New, keep, stdout, stderr)
+}
+
+func runConformanceOpenCode(keep bool, stdout, stderr io.Writer) int {
+	return runConformance("opencode", runtimecache.OpenCodeBinaryPath, conformanceopencode.New, keep, stdout, stderr)
+}
+
+func runConformance[T harness.Case](name string, binaryPath func() (string, error), newCase func(string) T, keep bool, stdout, stderr io.Writer) int {
+	bin, err := binaryPath()
 	if err != nil {
-		fmt.Fprintf(stderr, "learning-loop: conformance codex: %v\n", err)
+		fmt.Fprintf(stderr, "learning-loop: conformance %s: %v\n", name, err)
 		return 1
 	}
-	c := conformancecodex.New(bin)
+	c := newCase(bin)
 	return harness.Run(c, harness.Options{Keep: keep, RuntimeDir: filepath.Dir(bin)}, stdout, stderr)
 }

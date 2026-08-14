@@ -49,8 +49,8 @@ type Installer interface {
 
 // Case is one real-Runtime conformance case. The harness owns shared
 // fixture creation, Installer invocation, timeouts, semantic assertions,
-// and diagnostic handling; each case owns its native launch and request
-// decoding.
+// and diagnostic handling; each case owns its native launch, test-only
+// configuration, streaming response shape, and request decoding.
 type Case interface {
 	// Name is the Runtime name, e.g. "codex".
 	Name() string
@@ -58,6 +58,16 @@ type Case interface {
 	PinnedRuntime() string
 	// Installer returns the production Installer for this Runtime.
 	Installer() Installer
+	// Configure writes the test-only Runtime Configuration into the
+	// isolated environment, e.g. Codex's disposable project trust or
+	// OpenCode's fake provider configuration.
+	Configure(env *Env) error
+	// ModelRequestPath is the provider path the Runtime posts its model
+	// requests to, e.g. "/v1/responses".
+	ModelRequestPath() string
+	// Completion is the valid canned streaming completion the loopback
+	// fake provider serves for the Runtime's model requests.
+	Completion() string
 	// Launch starts the pinned Runtime against the harness environment and
 	// returns when it exits. It must launch the cached pinned executable
 	// rather than whichever executable appears on PATH.
@@ -104,7 +114,6 @@ type Env struct {
 	WorkDir     string
 	Project     string
 	RuntimeHome string
-	SQLiteHome  string
 	BinDir      string
 	RuntimeDir  string
 	Provider    *FakeProvider
@@ -156,7 +165,7 @@ func Run(c Case, opts Options, stdout, stderr io.Writer) int {
 			fmt.Errorf("Runtime exited with code %d", launch.ExitCode))
 	}
 
-	reqs := env.Provider.ResponsesRequests()
+	reqs := env.Provider.ModelRequests()
 	if len(reqs) != 1 {
 		return fail(c, env, opts, stderr, "requests", installerMessages, &launch,
 			fmt.Errorf("expected exactly one outbound model request, got %d", len(reqs)))
@@ -180,8 +189,9 @@ func Run(c Case, opts Options, stdout, stderr io.Writer) int {
 }
 
 // Prepare creates the disposable Git project, the Record Store with the
-// standalone Rule, the isolated Runtime environment, and the learning-loop
-// PATH bridge. The caller owns cleanup of Env.WorkDir.
+// standalone Rule, the isolated Runtime environment, the case's test-only
+// Runtime Configuration, and the learning-loop PATH bridge. The caller owns
+// cleanup of Env.WorkDir.
 func Prepare(c Case, opts Options) (*Env, error) {
 	workDir, err := os.MkdirTemp("", "learning-loop-conformance-*")
 	if err != nil {
@@ -205,9 +215,8 @@ func Prepare(c Case, opts Options) (*Env, error) {
 	}
 	env.RuleBody = string(expected)
 	env.RuntimeHome = filepath.Join(workDir, "runtime-home")
-	env.SQLiteHome = filepath.Join(workDir, "sqlite-home")
 	env.BinDir = filepath.Join(workDir, "bin")
-	for _, dir := range []string{env.RuntimeHome, env.SQLiteHome, env.BinDir} {
+	for _, dir := range []string{env.RuntimeHome, env.BinDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}
@@ -219,23 +228,11 @@ func Prepare(c Case, opts Options) (*Env, error) {
 	if err := os.Symlink(exe, filepath.Join(env.BinDir, "learning-loop")); err != nil {
 		return nil, err
 	}
-	env.Provider = NewFakeProvider()
-	if err := writeRuntimeConfig(env); err != nil {
+	env.Provider = NewFakeProvider(c.ModelRequestPath(), c.Completion())
+	if err := c.Configure(env); err != nil {
 		return nil, err
 	}
 	return env, nil
-}
-
-// writeRuntimeConfig writes the test-only Runtime Configuration the harness
-// owns: the isolated Runtime home's config.toml. Codex gates project-local
-// hooks on project trust, so the disposable project is marked trusted there.
-func writeRuntimeConfig(env *Env) error {
-	canonical, err := filepath.EvalSymlinks(env.Project)
-	if err != nil {
-		return err
-	}
-	config := fmt.Sprintf("[projects.%q]\ntrust_level = \"trusted\"\n", canonical)
-	return os.WriteFile(filepath.Join(env.RuntimeHome, "config.toml"), []byte(config), 0o644)
 }
 
 // initGitProject creates a disposable Git project with one initial commit.
@@ -332,7 +329,7 @@ func fail(c Case, env *Env, opts Options, stderr io.Writer, stage string, instal
 		fmt.Fprintf(stderr, "- runtime stdout: %s\n", bounded(string(launch.Stdout), 8*1024))
 		fmt.Fprintf(stderr, "- runtime stderr: %s\n", bounded(string(launch.Stderr), 8*1024))
 	}
-	reqs := env.Provider.ResponsesRequests()
+	reqs := env.Provider.ModelRequests()
 	fmt.Fprintf(stderr, "- outbound model requests: %d\n", len(reqs))
 	for i, r := range reqs {
 		fmt.Fprintf(stderr, "- request %d: %s %s\n", i+1, r.Method, r.Path)
