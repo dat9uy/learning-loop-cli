@@ -384,15 +384,15 @@ func TestCodexAdapterCommandEmitsEnvelope(t *testing.T) {
 	}
 }
 
-// populateCodexCache writes a fake cached codex executable with a matching
-// recorded checksum into the given cache directory.
-func populateCodexCache(t *testing.T, cacheDir, script string) {
+// populateRuntimeCache writes a fake cached Runtime executable with a
+// matching recorded checksum into the given cache directory.
+func populateRuntimeCache(t *testing.T, cacheDir, name, version, script string) {
 	t.Helper()
-	target := filepath.Join(cacheDir, "codex-"+runtimecache.CodexVersion)
+	target := filepath.Join(cacheDir, name+"-"+version)
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	bin := filepath.Join(target, "codex")
+	bin := filepath.Join(target, name)
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestConformanceCodexMissingCacheReportsRemediation(t *testing.T) {
 func TestConformanceCodexFailurePrintsSanitizedBundle(t *testing.T) {
 	cacheDir := t.TempDir()
 	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
-	populateCodexCache(t, cacheDir, "#!/bin/sh\nexit 0\n")
+	populateRuntimeCache(t, cacheDir, "codex", runtimecache.CodexVersion, "#!/bin/sh\nexit 0\n")
 
 	code, _, stderr := run(t, "conformance", "codex")
 	if code == 0 {
@@ -451,7 +451,7 @@ func TestConformanceCodexFailurePrintsSanitizedBundle(t *testing.T) {
 func TestRuntimeSetupCodexIdempotentWithValidCache(t *testing.T) {
 	cacheDir := t.TempDir()
 	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
-	populateCodexCache(t, cacheDir, "#!/bin/sh\necho fake codex\n")
+	populateRuntimeCache(t, cacheDir, "codex", runtimecache.CodexVersion, "#!/bin/sh\necho fake codex\n")
 
 	code, stdout, stderr := run(t, "runtime-setup", "codex")
 	if code != 0 {
@@ -462,10 +462,70 @@ func TestRuntimeSetupCodexIdempotentWithValidCache(t *testing.T) {
 	}
 }
 
+func TestConformanceOpenCodeMissingCacheReportsRemediation(t *testing.T) {
+	t.Setenv("LEARNING_LOOP_CACHE", t.TempDir())
+	code, stdout, stderr := run(t, "conformance", "opencode")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "E300") {
+		t.Fatalf("stderr = %q, want stable code E300", stderr)
+	}
+	if !strings.Contains(stderr, "learning-loop runtime-setup opencode") {
+		t.Fatalf("stderr = %q, want the exact setup remediation", stderr)
+	}
+}
+
+func TestConformanceOpenCodeFailurePrintsSanitizedBundle(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populateRuntimeCache(t, cacheDir, "opencode", runtimecache.OpenCodeVersion, "#!/bin/sh\nexit 0\n")
+
+	code, _, stderr := run(t, "conformance", "opencode")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if !strings.Contains(stderr, "conformance opencode: FAIL") {
+		t.Fatalf("stderr = %q, want FAIL banner", stderr)
+	}
+	if !strings.Contains(stderr, "pinned runtime: opencode "+runtimecache.OpenCodeVersion) {
+		t.Fatalf("stderr = %q, want the pinned version", stderr)
+	}
+	if !strings.Contains(stderr, "outbound model requests: 0") {
+		t.Fatalf("stderr = %q, want the request count", stderr)
+	}
+	if !strings.Contains(stderr, "launch arguments:") {
+		t.Fatalf("stderr = %q, want the launch arguments", stderr)
+	}
+	if !strings.Contains(stderr, "runtime stdout:") || !strings.Contains(stderr, "runtime stderr:") {
+		t.Fatalf("stderr = %q, want bounded runtime output", stderr)
+	}
+	if strings.Contains(stderr, "apiKey") {
+		t.Fatalf("stderr = %q, want sanitized output", stderr)
+	}
+}
+
+func TestRuntimeSetupOpenCodeIdempotentWithValidCache(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populateRuntimeCache(t, cacheDir, "opencode", runtimecache.OpenCodeVersion, "#!/bin/sh\necho fake opencode\n")
+
+	code, stdout, stderr := run(t, "runtime-setup", "opencode")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "cached at") {
+		t.Fatalf("stdout = %q, want cache confirmation", stdout)
+	}
+}
+
 func TestConformanceUsageErrors(t *testing.T) {
 	for _, args := range [][]string{
-		{"conformance"}, {"conformance", "opencode"}, {"conformance", "codex", "--bogus"},
-		{"runtime-setup"}, {"runtime-setup", "opencode"},
+		{"conformance"}, {"conformance", "bogus"}, {"conformance", "codex", "--bogus"},
+		{"runtime-setup"}, {"runtime-setup", "bogus"},
 	} {
 		code, stdout, stderr := run(t, args...)
 		if code == 0 {

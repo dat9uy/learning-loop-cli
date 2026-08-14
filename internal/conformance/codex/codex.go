@@ -2,7 +2,9 @@
 // launches the cached pinned Codex executable against the shared Test
 // Harness and decodes the captured Responses API request. All shared
 // fixture creation, Installer invocation, timeouts, semantic assertions,
-// and diagnostic handling live in the harness.
+// and diagnostic handling live in the harness; only native launch, the
+// disposable project trust configuration, the streaming response shape, and
+// request decoding are Codex-specific.
 package codex
 
 import (
@@ -12,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	codexadapter "github.com/dat9uy/learning-loop-cli/internal/codex"
 	"github.com/dat9uy/learning-loop-cli/internal/harness"
@@ -44,10 +47,38 @@ func (Case) Installer() harness.Installer {
 	return codexadapter.New()
 }
 
+// Configure implements harness.Case: it writes the disposable project trust
+// into the isolated Codex home. Codex gates project-local hooks on project
+// trust, and only this harness-owned disposable invocation may bypass it.
+func (Case) Configure(env *harness.Env) error {
+	canonical, err := filepath.EvalSymlinks(env.Project)
+	if err != nil {
+		return err
+	}
+	config := fmt.Sprintf("[projects.%q]\ntrust_level = \"trusted\"\n", canonical)
+	return os.WriteFile(filepath.Join(env.RuntimeHome, "config.toml"), []byte(config), 0o644)
+}
+
+// ModelRequestPath implements harness.Case: Codex posts model requests to
+// the Responses API.
+func (Case) ModelRequestPath() string {
+	return "/v1/responses"
+}
+
+// Completion implements harness.Case: the canned Responses API streaming
+// completion the loopback fake provider serves.
+func (Case) Completion() string {
+	return responsesCompletion
+}
+
 // Launch implements harness.Case. It launches the cached pinned Codex
 // executable — never whichever executable appears on PATH — with the
 // disposable invocation's hook-trust bypass, and returns when it exits.
 func (c Case) Launch(ctx context.Context, env *harness.Env) (harness.LaunchResult, error) {
+	sqliteHome := filepath.Join(env.WorkDir, "sqlite-home")
+	if err := os.MkdirAll(sqliteHome, 0o755); err != nil {
+		return harness.LaunchResult{}, err
+	}
 	args := []string{
 		"exec",
 		"-c", "openai_base_url=" + env.Provider.URL() + "/v1",
@@ -58,7 +89,7 @@ func (c Case) Launch(ctx context.Context, env *harness.Env) (harness.LaunchResul
 	cmd.Dir = env.Project
 	cmd.Env = append(os.Environ(),
 		"CODEX_HOME="+env.RuntimeHome,
-		"CODEX_SQLITE_HOME="+env.SQLiteHome,
+		"CODEX_SQLITE_HOME="+sqliteHome,
 		"OPENAI_API_KEY=dummy",
 		"PATH="+env.Path(),
 	)
@@ -109,3 +140,17 @@ func (Case) DecodeRequest(body []byte) (harness.DecodedRequest, error) {
 	}
 	return d, nil
 }
+
+// responsesCompletion is a valid Responses API streaming completion: a
+// created response, one assistant output item, and a completed response. It
+// mirrors the event shape the pinned Codex CLI's own test suite serves.
+const responsesCompletion = `event: response.created
+data: {"type":"response.created","response":{"id":"response_1"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","id":"response_1","content":[{"type":"output_text","text":"done"}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"response_1","usage":{"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}}}
+
+`

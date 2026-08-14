@@ -7,8 +7,16 @@ import (
 	"testing"
 )
 
-func TestFakeProviderCapturesResponsesRequest(t *testing.T) {
-	p := NewFakeProvider()
+const testCompletion = `event: response.created
+data: {"type":"response.created","response":{"id":"response_1"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"response_1","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}
+
+`
+
+func TestFakeProviderCapturesModelRequest(t *testing.T) {
+	p := NewFakeProvider("/v1/responses", testCompletion)
 	defer p.Close()
 
 	body := `{"model":"gpt-5","input":[]}`
@@ -31,9 +39,9 @@ func TestFakeProviderCapturesResponsesRequest(t *testing.T) {
 		t.Fatalf("canned completion missing response.completed: %q", data)
 	}
 
-	reqs := p.ResponsesRequests()
+	reqs := p.ModelRequests()
 	if len(reqs) != 1 {
-		t.Fatalf("captured %d responses requests, want 1", len(reqs))
+		t.Fatalf("captured %d model requests, want 1", len(reqs))
 	}
 	if reqs[0].Method != http.MethodPost || reqs[0].Path != "/v1/responses" {
 		t.Fatalf("request = %s %s, want POST /v1/responses", reqs[0].Method, reqs[0].Path)
@@ -43,8 +51,21 @@ func TestFakeProviderCapturesResponsesRequest(t *testing.T) {
 	}
 }
 
+func TestFakeProviderCountsOnlyTheModelPath(t *testing.T) {
+	p := NewFakeProvider("/v1/chat/completions", testCompletion)
+	defer p.Close()
+
+	http.Post(p.URL()+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[]}`))
+	http.Post(p.URL()+"/v1/other", "application/json", strings.NewReader(`{}`))
+	http.Get(p.URL() + "/v1/models")
+
+	if got := p.ModelRequests(); len(got) != 1 {
+		t.Fatalf("model requests = %d, want 1 (only the chat completions POST)", len(got))
+	}
+}
+
 func TestFakeProviderServesModelsProbe(t *testing.T) {
-	p := NewFakeProvider()
+	p := NewFakeProvider("/v1/chat/completions", testCompletion)
 	defer p.Close()
 
 	resp, err := http.Get(p.URL() + "/v1/models")
@@ -59,13 +80,13 @@ func TestFakeProviderServesModelsProbe(t *testing.T) {
 	if !strings.Contains(string(data), `"models"`) {
 		t.Fatalf("models response = %q, want models list", data)
 	}
-	if got := p.ResponsesRequests(); len(got) != 0 {
+	if got := p.ModelRequests(); len(got) != 0 {
 		t.Fatalf("models probe counted as a model request: %d", len(got))
 	}
 }
 
 func TestFakeProviderUnknownPathIsNotFound(t *testing.T) {
-	p := NewFakeProvider()
+	p := NewFakeProvider("/v1/chat/completions", testCompletion)
 	defer p.Close()
 
 	resp, err := http.Get(p.URL() + "/v1/other")

@@ -7,6 +7,7 @@ package runtimecache
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
@@ -25,8 +26,15 @@ import (
 // contract the conformance case validates.
 const CodexVersion = "0.147.0"
 
+// OpenCodeVersion is the pinned OpenCode version whose plugin contract the
+// conformance case validates.
+const OpenCodeVersion = "1.18.18"
+
 // codexReleaseTag is the GitHub release tag carrying the pinned Codex CLI.
 const codexReleaseTag = "rust-v0.147.0"
+
+// openCodeReleaseTag is the GitHub release tag carrying the pinned OpenCode.
+const openCodeReleaseTag = "v1.18.18"
 
 // Error is a stable, code-carrying failure.
 type Error struct {
@@ -38,11 +46,20 @@ func (e *Error) Error() string {
 	return e.Code + ": " + e.Msg
 }
 
+// archiveKind is the compression of one download target.
+type archiveKind int
+
+const (
+	archiveTarGz archiveKind = iota
+	archiveZip
+)
+
 // platform describes one supported download target.
 type platform struct {
 	archive string
 	sha256  string
 	binary  string
+	kind    archiveKind
 }
 
 // codexPlatforms maps GOOS/GOARCH to the pinned Codex package archive. The
@@ -52,31 +69,78 @@ var codexPlatforms = map[string]platform{
 		archive: "codex-package-x86_64-unknown-linux-musl.tar.gz",
 		sha256:  "bd758d53d56e41dc65e045f4589df79a038ed197a011adcb52a258e6ad64cfda",
 		binary:  "bin/codex",
+		kind:    archiveTarGz,
 	},
 	"linux/arm64": {
 		archive: "codex-package-aarch64-unknown-linux-musl.tar.gz",
 		sha256:  "89cbf79bd5ae6f9c58da47e8079f311c84219350c9c43c070d42f3e9b2a81401",
 		binary:  "bin/codex",
+		kind:    archiveTarGz,
 	},
 	"darwin/amd64": {
 		archive: "codex-package-x86_64-apple-darwin.tar.gz",
 		sha256:  "d91e59133daf923bc45d76e3da4af8ae9ef62a0231da18488da0cd573b6e9d63",
 		binary:  "bin/codex",
+		kind:    archiveTarGz,
 	},
 	"darwin/arm64": {
 		archive: "codex-package-aarch64-apple-darwin.tar.gz",
 		sha256:  "17b2984eb22b607e3d0c25728252fc90f510e476bad39a6d9f45cdb1aa685432",
 		binary:  "bin/codex",
+		kind:    archiveTarGz,
 	},
 	"windows/amd64": {
 		archive: "codex-package-x86_64-pc-windows-msvc.tar.gz",
 		sha256:  "c156c8feb8cb20197bf74d2c6daffed1fec0a8c21a03bc2ca90d7ff81927b0c5",
 		binary:  "bin/codex.exe",
+		kind:    archiveTarGz,
 	},
 	"windows/arm64": {
 		archive: "codex-package-aarch64-pc-windows-msvc.tar.gz",
 		sha256:  "4533928d72ac4d7c19f16e8c4acdfd02dc255d2aeeb2f6d7dfd45493ec4c0806",
 		binary:  "bin/codex.exe",
+		kind:    archiveTarGz,
+	},
+}
+
+// openCodePlatforms maps GOOS/GOARCH to the pinned OpenCode package archive.
+// The checksums are the values published in the v1.18.18 release digests.
+var openCodePlatforms = map[string]platform{
+	"linux/amd64": {
+		archive: "opencode-linux-x64.tar.gz",
+		sha256:  "0cddc222418b8553669905a8980c0cda7088f00da24d83d6ac76b01c9fdb2aaf",
+		binary:  "opencode",
+		kind:    archiveTarGz,
+	},
+	"linux/arm64": {
+		archive: "opencode-linux-arm64.tar.gz",
+		sha256:  "dcb1b5ec5687b43f87749560021f9203f3809e0ce5ae44ff9be8ae17083fe4ba",
+		binary:  "opencode",
+		kind:    archiveTarGz,
+	},
+	"darwin/amd64": {
+		archive: "opencode-darwin-x64.zip",
+		sha256:  "9581bd7683a7528456179fb11e3377d9ef568e10a935611a2c6722e349454d83",
+		binary:  "opencode",
+		kind:    archiveZip,
+	},
+	"darwin/arm64": {
+		archive: "opencode-darwin-arm64.zip",
+		sha256:  "7d668bf26496fec8686d4e51ebb1ac2bd2e393f0c1620aa696c4c242a9e5806a",
+		binary:  "opencode",
+		kind:    archiveZip,
+	},
+	"windows/amd64": {
+		archive: "opencode-windows-x64.zip",
+		sha256:  "c6d265376fdb93164013671b0cf402410184f73c34fc15d82d40a16a745b15f4",
+		binary:  "opencode.exe",
+		kind:    archiveZip,
+	},
+	"windows/arm64": {
+		archive: "opencode-windows-arm64.zip",
+		sha256:  "0d34d837ea3b5e10349d8550318083040a8b4c061d3faaa4eabd339984aa49b0",
+		binary:  "opencode.exe",
+		kind:    archiveZip,
 	},
 }
 
@@ -102,27 +166,38 @@ func CacheDir() (string, error) {
 // checksum. It never downloads or installs. When the cached prerequisite is
 // absent or invalid it returns an *Error with the exact setup remediation.
 func CodexBinaryPath() (string, error) {
-	dir, err := CacheDir()
-	if err != nil {
-		return "", err
-	}
-	p, err := currentPlatform()
-	if err != nil {
-		return "", err
-	}
-	bin := filepath.Join(dir, "codex-"+CodexVersion, filepath.Base(p.binary))
-	if err := validateBinary(bin); err != nil {
-		return "", &Error{Code: "E300", Msg: fmt.Sprintf("cached Codex %s is absent or invalid (%v); run `learning-loop runtime-setup codex`", CodexVersion, err)}
-	}
-	return bin, nil
+	return cachedBinaryPath("codex", "Codex", CodexVersion, codexPlatforms)
+}
+
+// OpenCodeBinaryPath returns the path of the cached pinned OpenCode
+// executable, validating that it exists, is executable, and matches the
+// recorded checksum. It never downloads or installs. When the cached
+// prerequisite is absent or invalid it returns an *Error with the exact
+// setup remediation.
+func OpenCodeBinaryPath() (string, error) {
+	return cachedBinaryPath("opencode", "OpenCode", OpenCodeVersion, openCodePlatforms)
 }
 
 // SetupCodex downloads the pinned Codex CLI, verifies its published
 // checksum, and stores it in the development Runtime cache. It is
 // idempotent: an already valid cached binary is left untouched.
 func SetupCodex() error {
-	return setupCodex(deps{
-		platform: currentPlatform,
+	return setupRuntime("openai/codex", "codex", CodexVersion, codexReleaseTag, deps{
+		platform: func() (platform, error) {
+			return currentPlatform(codexPlatforms, "Codex "+CodexVersion)
+		},
+		download: downloadArchive,
+	})
+}
+
+// SetupOpenCode downloads the pinned OpenCode, verifies its published
+// checksum, and stores it in the development Runtime cache. It is
+// idempotent: an already valid cached binary is left untouched.
+func SetupOpenCode() error {
+	return setupRuntime("sst/opencode", "opencode", OpenCodeVersion, openCodeReleaseTag, deps{
+		platform: func() (platform, error) {
+			return currentPlatform(openCodePlatforms, "OpenCode "+OpenCodeVersion)
+		},
 		download: downloadArchive,
 	})
 }
@@ -132,7 +207,28 @@ type deps struct {
 	download func(url string) ([]byte, error)
 }
 
-func setupCodex(d deps) error {
+// runtimeDir returns the cache subdirectory for one pinned Runtime.
+func runtimeDir(name, version string) string {
+	return name + "-" + version
+}
+
+func cachedBinaryPath(name, display, version string, platforms map[string]platform) (string, error) {
+	dir, err := CacheDir()
+	if err != nil {
+		return "", err
+	}
+	p, err := currentPlatform(platforms, display+" "+version)
+	if err != nil {
+		return "", err
+	}
+	bin := filepath.Join(dir, runtimeDir(name, version), filepath.Base(p.binary))
+	if err := validateBinary(bin); err != nil {
+		return "", &Error{Code: "E300", Msg: fmt.Sprintf("cached %s %s is absent or invalid (%v); run `learning-loop runtime-setup %s`", display, version, err, name)}
+	}
+	return bin, nil
+}
+
+func setupRuntime(repo, name, version, tag string, d deps) error {
 	p, err := d.platform()
 	if err != nil {
 		return err
@@ -141,7 +237,7 @@ func setupCodex(d deps) error {
 	if err != nil {
 		return err
 	}
-	target := filepath.Join(dir, "codex-"+CodexVersion)
+	target := filepath.Join(dir, runtimeDir(name, version))
 	bin := filepath.Join(target, filepath.Base(p.binary))
 	if err := validateBinary(bin); err == nil {
 		return nil
@@ -149,7 +245,7 @@ func setupCodex(d deps) error {
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return &Error{Code: "E301", Msg: fmt.Sprintf("creating the Runtime cache: %v", err)}
 	}
-	url := "https://github.com/openai/codex/releases/download/" + codexReleaseTag + "/" + p.archive
+	url := "https://github.com/" + repo + "/releases/download/" + tag + "/" + p.archive
 	archive, err := d.download(url)
 	if err != nil {
 		return &Error{Code: "E301", Msg: fmt.Sprintf("downloading %s: %v", url, err)}
@@ -157,7 +253,7 @@ func setupCodex(d deps) error {
 	if sum := sha256.Sum256(archive); hex.EncodeToString(sum[:]) != p.sha256 {
 		return &Error{Code: "E301", Msg: fmt.Sprintf("checksum mismatch for %s; refusing to cache it", p.archive)}
 	}
-	content, err := extractEntry(archive, p.binary)
+	content, err := extractEntry(archive, p.binary, p.kind)
 	if err != nil {
 		return &Error{Code: "E301", Msg: fmt.Sprintf("extracting %s from %s: %v", p.binary, p.archive, err)}
 	}
@@ -168,10 +264,10 @@ func setupCodex(d deps) error {
 }
 
 // currentPlatform resolves the download target for the running platform.
-func currentPlatform() (platform, error) {
-	p, ok := codexPlatforms[runtime.GOOS+"/"+runtime.GOARCH]
+func currentPlatform(platforms map[string]platform, label string) (platform, error) {
+	p, ok := platforms[runtime.GOOS+"/"+runtime.GOARCH]
 	if !ok {
-		return platform{}, &Error{Code: "E306", Msg: fmt.Sprintf("no pinned Codex %s archive for %s/%s", CodexVersion, runtime.GOOS, runtime.GOARCH)}
+		return platform{}, &Error{Code: "E306", Msg: fmt.Sprintf("no pinned %s archive for %s/%s", label, runtime.GOOS, runtime.GOARCH)}
 	}
 	return p, nil
 }
@@ -190,8 +286,26 @@ func downloadArchive(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// extractEntry returns the bytes of the named entry inside a tar.gz archive.
-func extractEntry(archive []byte, name string) ([]byte, error) {
+// extractEntry returns the bytes of the named entry inside a tar.gz or zip
+// archive.
+func extractEntry(archive []byte, name string, kind archiveKind) ([]byte, error) {
+	if kind == archiveZip {
+		zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range zr.File {
+			if f.Name == name {
+				rc, err := f.Open()
+				if err != nil {
+					return nil, err
+				}
+				defer rc.Close()
+				return io.ReadAll(rc)
+			}
+		}
+		return nil, fmt.Errorf("entry %q not found", name)
+	}
 	gz, err := gzip.NewReader(bytes.NewReader(archive))
 	if err != nil {
 		return nil, err
@@ -214,7 +328,7 @@ func extractEntry(archive []byte, name string) ([]byte, error) {
 
 // writeBinary writes the binary and its recorded checksum atomically.
 func writeBinary(target, bin string, content []byte) error {
-	tmp, err := os.CreateTemp(target, ".codex-*")
+	tmp, err := os.CreateTemp(target, ".runtime-*")
 	if err != nil {
 		return &Error{Code: "E301", Msg: fmt.Sprintf("writing the cached binary: %v", err)}
 	}
@@ -236,7 +350,7 @@ func writeBinary(target, bin string, content []byte) error {
 	}
 	sum := sha256.Sum256(content)
 	record := hex.EncodeToString(sum[:]) + "\n"
-	sumTmp, err := os.CreateTemp(target, ".codex-*")
+	sumTmp, err := os.CreateTemp(target, ".runtime-*")
 	if err != nil {
 		return &Error{Code: "E301", Msg: fmt.Sprintf("recording the cached checksum: %v", err)}
 	}
