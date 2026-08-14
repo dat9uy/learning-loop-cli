@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/dat9uy/learning-loop-cli/internal/recordstore"
+	"github.com/dat9uy/learning-loop-cli/internal/runtimecache"
 )
 
 func run(t *testing.T, args ...string) (code int, stdout, stderr string) {
@@ -297,5 +300,101 @@ func TestCodexAdapterCommandEmitsEnvelope(t *testing.T) {
 	}
 	if !strings.Contains(stdout, `"additionalContext":"alpha body\n"`) {
 		t.Fatalf("stdout = %q, want rendered Instruction in additionalContext", stdout)
+	}
+}
+
+// populateCodexCache writes a fake cached codex executable with a matching
+// recorded checksum into the given cache directory.
+func populateCodexCache(t *testing.T, cacheDir, script string) {
+	t.Helper()
+	target := filepath.Join(cacheDir, "codex-"+runtimecache.CodexVersion)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	bin := filepath.Join(target, "codex")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	sum := sha256.Sum256([]byte(script))
+	if err := os.WriteFile(bin+".sha256", []byte(hex.EncodeToString(sum[:])+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile checksum: %v", err)
+	}
+}
+
+func TestConformanceCodexMissingCacheReportsRemediation(t *testing.T) {
+	t.Setenv("LEARNING_LOOP_CACHE", t.TempDir())
+	code, stdout, stderr := run(t, "conformance", "codex")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "E300") {
+		t.Fatalf("stderr = %q, want stable code E300", stderr)
+	}
+	if !strings.Contains(stderr, "learning-loop runtime-setup codex") {
+		t.Fatalf("stderr = %q, want the exact setup remediation", stderr)
+	}
+}
+
+func TestConformanceCodexFailurePrintsSanitizedBundle(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populateCodexCache(t, cacheDir, "#!/bin/sh\nexit 0\n")
+
+	code, _, stderr := run(t, "conformance", "codex")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if !strings.Contains(stderr, "conformance codex: FAIL") {
+		t.Fatalf("stderr = %q, want FAIL banner", stderr)
+	}
+	if !strings.Contains(stderr, "pinned runtime: codex "+runtimecache.CodexVersion) {
+		t.Fatalf("stderr = %q, want the pinned version", stderr)
+	}
+	if !strings.Contains(stderr, "outbound model requests: 0") {
+		t.Fatalf("stderr = %q, want the request count", stderr)
+	}
+	if !strings.Contains(stderr, "launch arguments:") {
+		t.Fatalf("stderr = %q, want the launch arguments", stderr)
+	}
+	if !strings.Contains(stderr, "runtime stdout:") || !strings.Contains(stderr, "runtime stderr:") {
+		t.Fatalf("stderr = %q, want bounded runtime output", stderr)
+	}
+	if strings.Contains(stderr, "OPENAI_API_KEY") {
+		t.Fatalf("stderr = %q, want sanitized output", stderr)
+	}
+}
+
+func TestRuntimeSetupCodexIdempotentWithValidCache(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populateCodexCache(t, cacheDir, "#!/bin/sh\necho fake codex\n")
+
+	code, stdout, stderr := run(t, "runtime-setup", "codex")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "cached at") {
+		t.Fatalf("stdout = %q, want cache confirmation", stdout)
+	}
+}
+
+func TestConformanceUsageErrors(t *testing.T) {
+	for _, args := range [][]string{
+		{"conformance"}, {"conformance", "opencode"}, {"conformance", "codex", "--bogus"},
+		{"runtime-setup"}, {"runtime-setup", "opencode"},
+	} {
+		code, stdout, stderr := run(t, args...)
+		if code == 0 {
+			t.Fatalf("args %v: exit code = 0, want nonzero", args)
+		}
+		if stdout != "" {
+			t.Fatalf("args %v: stdout = %q, want empty", args, stdout)
+		}
+		if !strings.Contains(stderr, "Usage:") {
+			t.Fatalf("args %v: stderr = %q, want usage", args, stderr)
+		}
 	}
 }
