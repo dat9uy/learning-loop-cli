@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,8 +13,13 @@ import (
 
 func run(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
+	return runStdin(t, "", args...)
+}
+
+func runStdin(t *testing.T, stdin string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
 	var out, errOut bytes.Buffer
-	code = Run(args, &out, &errOut)
+	code = Run(args, strings.NewReader(stdin), &out, &errOut)
 	return code, out.String(), errOut.String()
 }
 
@@ -174,7 +180,7 @@ func TestRenderRequiresAbsoluteRoot(t *testing.T) {
 }
 
 func TestUsageErrors(t *testing.T) {
-	for _, args := range [][]string{nil, {"bogus"}, {"render"}, {"init"}} {
+	for _, args := range [][]string{nil, {"bogus"}, {"render"}, {"init"}, {"connect"}, {"connect", "opencode", "/tmp/x"}, {"disconnect"}, {"disconnect", "opencode", "/tmp/x"}, {"codex-adapter", "extra"}} {
 		code, stdout, stderr := run(t, args...)
 		if code == 0 {
 			t.Fatalf("args %v: exit code = 0, want nonzero", args)
@@ -185,5 +191,111 @@ func TestUsageErrors(t *testing.T) {
 		if !strings.Contains(stderr, "Usage:") {
 			t.Fatalf("args %v: stderr = %q, want usage", args, stderr)
 		}
+	}
+}
+
+func fakePathEnv(t *testing.T, codexVersion string) string {
+	t.Helper()
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable: %v", err)
+	}
+	if err := os.Symlink(exe, filepath.Join(dir, "learning-loop")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	script := filepath.Join(dir, "codex")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho "+codexVersion+"\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return dir
+}
+
+func TestConnectCodexCreatesHook(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", fakePathEnv(t, "codex-cli 0.147.0")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	code, stdout, stderr := run(t, "connect", "codex", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "connected Codex to "+root) {
+		t.Fatalf("stdout = %q, want connection confirmation", stdout)
+	}
+	if !strings.Contains(stdout, "hook trust is pending") {
+		t.Fatalf("stdout = %q, want trust pending report", stdout)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".codex", "hooks.json"))
+	if err != nil {
+		t.Fatalf("hooks.json: %v", err)
+	}
+	if !strings.Contains(string(data), "learning-loop codex-adapter") {
+		t.Fatalf("hooks.json = %q, want learning-loop handler", data)
+	}
+}
+
+func TestConnectCodexWarnsForDifferentVersion(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", fakePathEnv(t, "codex-cli 0.123.0")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	code, stdout, stderr := run(t, "connect", "codex", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "warning: Codex 0.123.0 is not the validated 0.147.0") {
+		t.Fatalf("stdout = %q, want version warning", stdout)
+	}
+}
+
+func TestConnectCodexPathMismatchFails(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	code, stdout, stderr := run(t, "connect", "codex", root)
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "E201") {
+		t.Fatalf("stderr = %q, want stable code E201", stderr)
+	}
+}
+
+func TestDisconnectCodexRemovesHook(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", fakePathEnv(t, "codex-cli 0.147.0")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if code, _, stderr := run(t, "connect", "codex", root); code != 0 {
+		t.Fatalf("connect exit code = %d (stderr: %s)", code, stderr)
+	}
+	code, stdout, stderr := run(t, "disconnect", "codex", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "disconnected Codex from "+root) {
+		t.Fatalf("stdout = %q, want disconnection confirmation", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".codex", "hooks.json")); !os.IsNotExist(err) {
+		t.Fatalf("hooks.json still exists after disconnect")
+	}
+}
+
+func TestCodexAdapterCommandEmitsEnvelope(t *testing.T) {
+	root := t.TempDir()
+	store := recordstore.New(root)
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := store.CreateRevision("alpha", []byte("---\nname: alpha\n---\nalpha body\n")); err != nil {
+		t.Fatalf("CreateRevision: %v", err)
+	}
+	event := fmt.Sprintf(`{"cwd":%q,"hook_event_name":"SessionStart","model":"o4-mini","permission_mode":"default","session_id":"s","source":"startup","transcript_path":null}`, root)
+	code, stdout, stderr := runStdin(t, event, "codex-adapter")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, `"hookEventName":"SessionStart"`) {
+		t.Fatalf("stdout = %q, want native envelope", stdout)
+	}
+	if !strings.Contains(stdout, `"additionalContext":"alpha body\n"`) {
+		t.Fatalf("stdout = %q, want rendered Instruction in additionalContext", stdout)
 	}
 }
