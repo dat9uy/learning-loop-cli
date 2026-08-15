@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -496,6 +498,37 @@ func populateRuntimeCache(t *testing.T, cacheDir, name, version, script string) 
 	}
 }
 
+// populatePiCache writes a fake cached pi npm tree with a matching recorded
+// integrity into the given cache directory. The entry point is a JavaScript
+// file because the pi case launches the cached tree via node.
+func populatePiCache(t *testing.T, cacheDir, version, entryPoint string) {
+	t.Helper()
+	target := filepath.Join(cacheDir, "pi-"+version)
+	entry := filepath.Join(target, "package", "dist", "cli.js")
+	if err := os.MkdirAll(filepath.Dir(entry), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(entry, []byte(entryPoint), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	pkg := filepath.Join(target, "package", "package.json")
+	if err := os.WriteFile(pkg, []byte(`{"name":"@earendil-works/pi-coding-agent","dependencies":{"cross-spawn":"7.0.6"}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(target, "package", "node_modules", "cross-spawn"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	tarball := filepath.Join(target, "pi-coding-agent-"+version+".tgz")
+	content := []byte("fake tarball " + version)
+	if err := os.WriteFile(tarball, content, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	sum := sha512.Sum512(content)
+	if err := os.WriteFile(tarball+".sha512", []byte(base64.StdEncoding.EncodeToString(sum[:])+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile integrity: %v", err)
+	}
+}
+
 func TestConformanceCodexMissingCacheReportsRemediation(t *testing.T) {
 	t.Setenv("LEARNING_LOOP_CACHE", t.TempDir())
 	code, stdout, stderr := run(t, "conformance", "codex")
@@ -616,16 +649,76 @@ func TestRuntimeSetupOpenCodeIdempotentWithValidCache(t *testing.T) {
 	}
 }
 
+func TestConformancePiMissingCacheReportsRemediation(t *testing.T) {
+	t.Setenv("LEARNING_LOOP_CACHE", t.TempDir())
+	code, stdout, stderr := run(t, "conformance", "pi")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "E300") {
+		t.Fatalf("stderr = %q, want stable code E300", stderr)
+	}
+	if !strings.Contains(stderr, "learning-loop runtime-setup pi") {
+		t.Fatalf("stderr = %q, want the exact setup remediation", stderr)
+	}
+}
+
+func TestConformancePiFailurePrintsSanitizedBundle(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populatePiCache(t, cacheDir, runtimecache.PiVersion, "console.log('fake pi')\n")
+
+	code, _, stderr := run(t, "conformance", "pi")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if !strings.Contains(stderr, "conformance pi: FAIL") {
+		t.Fatalf("stderr = %q, want FAIL banner", stderr)
+	}
+	if !strings.Contains(stderr, "pinned runtime: pi "+runtimecache.PiVersion) {
+		t.Fatalf("stderr = %q, want the pinned version", stderr)
+	}
+	if !strings.Contains(stderr, "outbound model requests: 0") {
+		t.Fatalf("stderr = %q, want the request count", stderr)
+	}
+	if !strings.Contains(stderr, "launch arguments:") {
+		t.Fatalf("stderr = %q, want the launch arguments", stderr)
+	}
+	if !strings.Contains(stderr, "runtime stdout:") || !strings.Contains(stderr, "runtime stderr:") {
+		t.Fatalf("stderr = %q, want bounded runtime output", stderr)
+	}
+	if strings.Contains(stderr, "apiKey") {
+		t.Fatalf("stderr = %q, want sanitized output", stderr)
+	}
+}
+
+func TestRuntimeSetupPiIdempotentWithValidCache(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populatePiCache(t, cacheDir, runtimecache.PiVersion, "console.log('fake pi')\n")
+
+	code, stdout, stderr := run(t, "runtime-setup", "pi")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "cached at") {
+		t.Fatalf("stdout = %q, want cache confirmation", stdout)
+	}
+}
+
 func TestRuntimeSelectionAcceptsEitherOrder(t *testing.T) {
-	got, err := selectRuntimes([]string{"opencode", "codex"})
+	got, err := selectRuntimes([]string{"pi", "opencode", "codex"})
 	if err != nil {
 		t.Fatalf("selectRuntimes: %v", err)
 	}
-	want := []string{"codex", "opencode"}
+	want := []string{"codex", "opencode", "pi"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("selected = %v, want %v", got, want)
 	}
-	for _, args := range [][]string{{"codex", "codex"}, {"opencode", "unknown"}} {
+	for _, args := range [][]string{{"codex", "codex"}, {"pi", "pi"}, {"opencode", "unknown"}} {
 		if _, err := selectRuntimes(args); err == nil {
 			t.Fatalf("selectRuntimes(%v) succeeded, want validation error", args)
 		}
@@ -637,8 +730,9 @@ func TestRuntimeSetupCombinedLeavesValidEntriesUntouched(t *testing.T) {
 	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
 	populateRuntimeCache(t, cacheDir, "codex", runtimecache.CodexVersion, "#!/bin/sh\necho codex\n")
 	populateRuntimeCache(t, cacheDir, "opencode", runtimecache.OpenCodeVersion, "#!/bin/sh\necho opencode\n")
+	populatePiCache(t, cacheDir, runtimecache.PiVersion, "console.log('fake pi')\n")
 
-	code, stdout, stderr := run(t, "runtime-setup", "opencode", "codex")
+	code, stdout, stderr := run(t, "runtime-setup", "pi", "opencode", "codex")
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
 	}
@@ -647,8 +741,9 @@ func TestRuntimeSetupCombinedLeavesValidEntriesUntouched(t *testing.T) {
 	}
 	codexAt := strings.Index(stdout, "Codex "+runtimecache.CodexVersion)
 	opencodeAt := strings.Index(stdout, "OpenCode "+runtimecache.OpenCodeVersion)
-	if codexAt < 0 || opencodeAt < 0 || codexAt > opencodeAt {
-		t.Fatalf("stdout = %q, want both cache confirmations in canonical order", stdout)
+	piAt := strings.Index(stdout, "pi "+runtimecache.PiVersion)
+	if codexAt < 0 || opencodeAt < 0 || piAt < 0 || codexAt > opencodeAt || opencodeAt > piAt {
+		t.Fatalf("stdout = %q, want all three cache confirmations in canonical order", stdout)
 	}
 }
 
@@ -658,7 +753,7 @@ func TestCombinedConformancePreflightsAllRuntimes(t *testing.T) {
 	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
 	populateRuntimeCache(t, cacheDir, "codex", runtimecache.CodexVersion, "#!/bin/sh\ntouch "+marker+"\nexit 0\n")
 
-	code, stdout, stderr := run(t, "conformance", "codex", "opencode")
+	code, stdout, stderr := run(t, "conformance", "codex", "opencode", "pi")
 	if code == 0 {
 		t.Fatalf("exit code = 0, want nonzero")
 	}
@@ -671,28 +766,34 @@ func TestCombinedConformancePreflightsAllRuntimes(t *testing.T) {
 	if !strings.Contains(stderr, "learning-loop runtime-setup opencode") {
 		t.Fatalf("stderr = %q, want the exact OpenCode repair command", stderr)
 	}
+	if !strings.Contains(stderr, "learning-loop runtime-setup pi") {
+		t.Fatalf("stderr = %q, want the exact pi repair command", stderr)
+	}
 }
 
-func TestCombinedConformanceRunsBothAndEmitsCanonicalOrder(t *testing.T) {
+func TestCombinedConformanceRunsAllThreeAndEmitsCanonicalOrder(t *testing.T) {
 	cacheDir := t.TempDir()
 	codexMarker := filepath.Join(t.TempDir(), "codex-launched")
 	openCodeMarker := filepath.Join(t.TempDir(), "opencode-launched")
+	piMarker := filepath.Join(t.TempDir(), "pi-launched")
 	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
 	populateRuntimeCache(t, cacheDir, "codex", runtimecache.CodexVersion, "#!/bin/sh\ntouch "+codexMarker+"\nexit 0\n")
 	populateRuntimeCache(t, cacheDir, "opencode", runtimecache.OpenCodeVersion, "#!/bin/sh\ntouch "+openCodeMarker+"\nexit 0\n")
+	populatePiCache(t, cacheDir, runtimecache.PiVersion, "require('fs').writeFileSync('"+piMarker+"', '')\n")
 
-	code, _, stderr := run(t, "conformance", "opencode", "codex")
+	code, _, stderr := run(t, "conformance", "pi", "opencode", "codex")
 	if code == 0 {
-		t.Fatalf("exit code = 0, want both fake cases to fail their semantic checks")
+		t.Fatalf("exit code = 0, want all three fake cases to fail their semantic checks")
 	}
-	for _, marker := range []string{codexMarker, openCodeMarker} {
+	for _, marker := range []string{codexMarker, openCodeMarker, piMarker} {
 		if _, err := os.Stat(marker); err != nil {
 			t.Fatalf("case did not launch: %s: %v", marker, err)
 		}
 	}
 	codexAt := strings.Index(stderr, "conformance codex: FAIL")
 	opencodeAt := strings.Index(stderr, "conformance opencode: FAIL")
-	if codexAt < 0 || opencodeAt < 0 || codexAt > opencodeAt {
+	piAt := strings.Index(stderr, "conformance pi: FAIL")
+	if codexAt < 0 || opencodeAt < 0 || piAt < 0 || codexAt > opencodeAt || opencodeAt > piAt {
 		t.Fatalf("stderr = %q, want failures in canonical order", stderr)
 	}
 }
@@ -700,20 +801,24 @@ func TestCombinedConformanceRunsBothAndEmitsCanonicalOrder(t *testing.T) {
 func TestStandaloneAndCombinedKeepRetainState(t *testing.T) {
 	cacheDir := t.TempDir()
 	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
-	for _, name := range []string{"codex", "opencode"} {
+	for _, name := range []string{"codex", "opencode", "pi"} {
 		version := runtimecache.CodexVersion
 		if name == "opencode" {
 			version = runtimecache.OpenCodeVersion
 		}
+		if name == "pi" {
+			populatePiCache(t, cacheDir, runtimecache.PiVersion, "console.log('fake pi')\n")
+			continue
+		}
 		populateRuntimeCache(t, cacheDir, name, version, "#!/bin/sh\nexit 0\n")
 	}
 
-	code, stdout, stderr := run(t, "conformance", "opencode", "codex", "--keep")
+	code, stdout, stderr := run(t, "conformance", "pi", "opencode", "codex", "--keep")
 	if code == 0 {
 		t.Fatalf("exit code = 0, want fake cases to fail semantic checks")
 	}
-	if strings.Count(stdout, "retaining full state at ") != 2 {
-		t.Fatalf("stdout = %q, want both retained-state paths", stdout)
+	if strings.Count(stdout, "retaining full state at ") != 3 {
+		t.Fatalf("stdout = %q, want all three retained-state paths", stdout)
 	}
 	if stderr == "" {
 		t.Fatalf("stderr = %q, want failure bundles", stderr)
@@ -743,8 +848,9 @@ func TestStandaloneAndCombinedKeepRetainState(t *testing.T) {
 func TestConformanceUsageErrors(t *testing.T) {
 	for _, args := range [][]string{
 		{"conformance"}, {"conformance", "bogus"}, {"conformance", "codex", "--bogus"},
-		{"conformance", "codex", "opencode", "opencode"}, {"conformance", "codex", "--keep", "opencode"},
-		{"runtime-setup"}, {"runtime-setup", "bogus"}, {"runtime-setup", "codex", "codex"},
+		{"conformance", "codex", "opencode", "opencode"}, {"conformance", "codex", "opencode", "pi", "pi"},
+		{"conformance", "codex", "--keep", "opencode"},
+		{"runtime-setup"}, {"runtime-setup", "bogus"}, {"runtime-setup", "codex", "codex"}, {"runtime-setup", "pi", "pi"},
 	} {
 		code, stdout, stderr := run(t, args...)
 		if code == 0 {

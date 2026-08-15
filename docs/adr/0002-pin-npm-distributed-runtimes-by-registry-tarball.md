@@ -10,5 +10,6 @@ The Runtime cache was built for Runtimes published as single release binaries wi
 ## Consequences
 
 - The cache abstraction now has two entry shapes — single binary and extracted npm tree — and the checksum kind follows each Runtime's distribution channel (SHA256 sums vs npm sha512 integrity) rather than being uniform.
-- `Case.Launch` for pi requires `node` on PATH in addition to the cached Runtime; contributor and CI environments must provide it.
+- The published pi package is not self-contained: its runtime dependencies are pinned by the `npm-shrinkwrap.json` inside the verified tarball, so `learning-loop runtime-setup pi` also runs `npm install --omit=dev` in the extracted tree once. The dependency tree is therefore pinned transitively by the tarball integrity, and conformance still never downloads.
+- `Case.Launch` for pi requires `node` on PATH in addition to the cached Runtime, and setup requires `npm`; contributor and CI environments must provide a Node.js runtime (which ships npm).
 - Pin migrations for pi mean bumping the npm version and its recorded integrity together, one pin at a time, same as binary Runtimes.

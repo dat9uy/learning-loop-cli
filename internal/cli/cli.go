@@ -10,6 +10,7 @@ import (
 	"github.com/dat9uy/learning-loop-cli/internal/codex"
 	conformancecodex "github.com/dat9uy/learning-loop-cli/internal/conformance/codex"
 	conformanceopencode "github.com/dat9uy/learning-loop-cli/internal/conformance/opencode"
+	conformancepi "github.com/dat9uy/learning-loop-cli/internal/conformance/pi"
 	"github.com/dat9uy/learning-loop-cli/internal/harness"
 	"github.com/dat9uy/learning-loop-cli/internal/opencode"
 	"github.com/dat9uy/learning-loop-cli/internal/pi"
@@ -30,8 +31,8 @@ Usage:
   learning-loop connect pi <project-root>        connect the project to pi
   learning-loop disconnect pi <project-root>     disconnect the project from pi
   learning-loop codex-adapter                    Codex SessionStart hook adapter (reads stdin)
-  learning-loop runtime-setup <codex|opencode> [<codex|opencode>]  download pinned Runtimes into the Runtime cache
-  learning-loop conformance <codex|opencode> [<codex|opencode>] [--keep]  run real-Runtime conformance cases
+  learning-loop runtime-setup <codex|opencode|pi> [<codex|opencode|pi> ...]  download pinned Runtimes into the Runtime cache
+  learning-loop conformance <codex|opencode|pi> [<codex|opencode|pi> ...] [--keep]  run real-Runtime conformance cases
 `
 
 // Run executes the CLI and returns the process exit code.
@@ -237,9 +238,16 @@ var runtimeTargets = map[string]runtimeTarget{
 		setup:      runtimecache.SetupOpenCode,
 		newCase:    func(binary string) harness.Case { return conformanceopencode.New(binary) },
 	},
+	"pi": {
+		display:    "pi",
+		version:    runtimecache.PiVersion,
+		binaryPath: runtimecache.PiTreePath,
+		setup:      runtimecache.SetupPi,
+		newCase:    func(entryPoint string) harness.Case { return conformancepi.New(entryPoint) },
+	},
 }
 
-var canonicalRuntimeNames = []string{"codex", "opencode"}
+var canonicalRuntimeNames = []string{"codex", "opencode", "pi"}
 
 type conformanceResult struct {
 	name   string
@@ -248,12 +256,12 @@ type conformanceResult struct {
 	stderr string
 }
 
-// selectRuntimes validates a one- or two-Runtime selection and returns it in
-// canonical order. Callers can therefore accept either input order without
-// making output or scheduling order depend on the command line.
+// selectRuntimes validates a one- to three-Runtime selection and returns it
+// in canonical order. Callers can therefore accept either input order
+// without making output or scheduling order depend on the command line.
 func selectRuntimes(args []string) ([]string, error) {
 	if len(args) < 1 || len(args) > len(canonicalRuntimeNames) {
-		return nil, fmt.Errorf("want one or two Runtime names")
+		return nil, fmt.Errorf("want one to three Runtime names")
 	}
 	seen := make(map[string]bool, len(args))
 	for _, name := range args {
