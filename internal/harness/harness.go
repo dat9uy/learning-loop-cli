@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -45,6 +46,13 @@ func (e *Error) Error() string {
 // performs the Installer's changes itself.
 type Installer interface {
 	Install(projectRoot string) ([]string, error)
+}
+
+// IsolatedInstaller is the optional harness seam used by production
+// Installers. It gives each concurrent case its own PATH without mutating the
+// process-global environment.
+type IsolatedInstaller interface {
+	InstallWithPath(projectRoot, path string) ([]string, error)
 }
 
 // Case is one real-Runtime conformance case. The harness owns shared
@@ -111,20 +119,21 @@ type Options struct {
 
 // Env is the isolated environment for one Runtime conformance case.
 type Env struct {
-	WorkDir     string
-	Project     string
-	RuntimeHome string
-	BinDir      string
-	RuntimeDir  string
-	Provider    *FakeProvider
-	RuleBody    string
-	Prompt      string
+	WorkDir       string
+	Project       string
+	RuntimeHome   string
+	BinDir        string
+	RuntimeDir    string
+	InheritedPath string
+	Provider      *FakeProvider
+	RuleBody      string
+	Prompt        string
 }
 
 // Path returns the isolated PATH: the learning-loop bridge directory, the
 // pinned Runtime directory, then the inherited PATH.
 func (e *Env) Path() string {
-	return e.BinDir + string(os.PathListSeparator) + e.RuntimeDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	return e.BinDir + string(os.PathListSeparator) + e.RuntimeDir + string(os.PathListSeparator) + e.InheritedPath
 }
 
 // Run executes one conformance case and returns the process exit code. It
@@ -147,10 +156,7 @@ func Run(c Case, opts Options, stdout, stderr io.Writer) int {
 	}
 	defer env.Provider.Close()
 
-	originalPath := os.Getenv("PATH")
-	os.Setenv("PATH", env.Path())
-	defer os.Setenv("PATH", originalPath)
-	installerMessages, installErr := c.Installer().Install(env.Project)
+	installerMessages, installErr := install(c.Installer(), env.Project, env.Path())
 	if installErr != nil {
 		return fail(c, env, opts, stderr, "installer", installerMessages, nil, installErr)
 	}
@@ -188,16 +194,43 @@ func Run(c Case, opts Options, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func install(installer Installer, projectRoot, path string) ([]string, error) {
+	if installer == nil {
+		return nil, errors.New("Runtime Installer is unavailable")
+	}
+	if isolated, ok := installer.(IsolatedInstaller); ok {
+		return isolated.InstallWithPath(projectRoot, path)
+	}
+	// Keep the original Installer seam usable for small external test cases.
+	// Production Runtime Installers implement IsolatedInstaller, so concurrent
+	// conformance runs never take this process-global fallback.
+	return installer.Install(projectRoot)
+}
+
 // Prepare creates the disposable Git project, the Record Store with the
 // standalone Rule, the isolated Runtime environment, the case's test-only
 // Runtime Configuration, and the learning-loop PATH bridge. The caller owns
-// cleanup of Env.WorkDir.
-func Prepare(c Case, opts Options) (*Env, error) {
+// cleanup of Env.WorkDir after a successful return.
+func Prepare(c Case, opts Options) (env *Env, err error) {
 	workDir, err := os.MkdirTemp("", "learning-loop-conformance-*")
 	if err != nil {
 		return nil, err
 	}
-	env := &Env{WorkDir: workDir, RuntimeDir: opts.RuntimeDir, Prompt: Prompt}
+	defer func() {
+		if err != nil {
+			if env != nil && env.Provider != nil {
+				env.Provider.Close()
+			}
+			_ = os.RemoveAll(workDir)
+		}
+	}()
+
+	env = &Env{
+		WorkDir:       workDir,
+		RuntimeDir:    opts.RuntimeDir,
+		InheritedPath: os.Getenv("PATH"),
+		Prompt:        Prompt,
+	}
 	env.Project = filepath.Join(workDir, "project")
 	if err := initGitProject(env.Project); err != nil {
 		return nil, err
@@ -314,31 +347,39 @@ func AssertFirstRequest(d DecodedRequest, ruleBody, prompt string) error {
 }
 
 // fail prints the bounded, sanitized failure bundle and returns exit code 1.
+var sensitiveValue = regexp.MustCompile("(?i)((?:api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|password|secret|token)[\\\"']?\\s*[:=]\\s*)(?:\\\"[^\\\"]*\\\"|'[^']*'|[^\\s,}]+)")
+
 func fail(c Case, env *Env, opts Options, stderr io.Writer, stage string, installerMessages []string, launch *LaunchResult, cause error) int {
 	fmt.Fprintf(stderr, "conformance %s: FAIL\n", c.Name())
 	fmt.Fprintf(stderr, "- stage: %s\n", stage)
-	fmt.Fprintf(stderr, "- cause: %v\n", cause)
+	fmt.Fprintf(stderr, "- cause: %s\n", bounded(sanitize(fmt.Sprint(cause)), 4*1024))
 	fmt.Fprintf(stderr, "- pinned runtime: %s\n", c.PinnedRuntime())
 	if len(installerMessages) > 0 {
 		for _, m := range installerMessages {
-			fmt.Fprintf(stderr, "- installer: %s\n", m)
+			fmt.Fprintf(stderr, "- installer: %s\n", bounded(sanitize(m), 4*1024))
 		}
+	} else {
+		fmt.Fprintln(stderr, "- installer: no result")
 	}
 	if launch != nil {
-		fmt.Fprintf(stderr, "- launch arguments: %s\n", strings.Join(launch.Args, " "))
-		fmt.Fprintf(stderr, "- runtime stdout: %s\n", bounded(string(launch.Stdout), 8*1024))
-		fmt.Fprintf(stderr, "- runtime stderr: %s\n", bounded(string(launch.Stderr), 8*1024))
+		fmt.Fprintf(stderr, "- launch arguments: %s\n", bounded(sanitize(strings.Join(launch.Args, " ")), 4*1024))
+		fmt.Fprintf(stderr, "- runtime stdout: %s\n", bounded(sanitize(string(launch.Stdout)), 8*1024))
+		fmt.Fprintf(stderr, "- runtime stderr: %s\n", bounded(sanitize(string(launch.Stderr)), 8*1024))
 	}
 	reqs := env.Provider.ModelRequests()
 	fmt.Fprintf(stderr, "- outbound model requests: %d\n", len(reqs))
 	for i, r := range reqs {
 		fmt.Fprintf(stderr, "- request %d: %s %s\n", i+1, r.Method, r.Path)
-		fmt.Fprintf(stderr, "  body: %s\n", bounded(string(r.Body), 4*1024))
+		fmt.Fprintf(stderr, "  body: %s\n", bounded(sanitize(string(r.Body)), 4*1024))
 	}
 	if opts.Keep {
 		fmt.Fprintf(stderr, "- full state retained at %s\n", env.WorkDir)
 	}
 	return 1
+}
+
+func sanitize(s string) string {
+	return sensitiveValue.ReplaceAllString(s, "$1[REDACTED]")
 }
 
 // bounded truncates s to at most n bytes with an explicit marker.

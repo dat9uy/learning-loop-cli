@@ -522,10 +522,135 @@ func TestRuntimeSetupOpenCodeIdempotentWithValidCache(t *testing.T) {
 	}
 }
 
+func TestRuntimeSelectionAcceptsEitherOrder(t *testing.T) {
+	got, err := selectRuntimes([]string{"opencode", "codex"})
+	if err != nil {
+		t.Fatalf("selectRuntimes: %v", err)
+	}
+	want := []string{"codex", "opencode"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("selected = %v, want %v", got, want)
+	}
+	for _, args := range [][]string{{"codex", "codex"}, {"opencode", "unknown"}} {
+		if _, err := selectRuntimes(args); err == nil {
+			t.Fatalf("selectRuntimes(%v) succeeded, want validation error", args)
+		}
+	}
+}
+
+func TestRuntimeSetupCombinedLeavesValidEntriesUntouched(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populateRuntimeCache(t, cacheDir, "codex", runtimecache.CodexVersion, "#!/bin/sh\necho codex\n")
+	populateRuntimeCache(t, cacheDir, "opencode", runtimecache.OpenCodeVersion, "#!/bin/sh\necho opencode\n")
+
+	code, stdout, stderr := run(t, "runtime-setup", "opencode", "codex")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	codexAt := strings.Index(stdout, "Codex "+runtimecache.CodexVersion)
+	opencodeAt := strings.Index(stdout, "OpenCode "+runtimecache.OpenCodeVersion)
+	if codexAt < 0 || opencodeAt < 0 || codexAt > opencodeAt {
+		t.Fatalf("stdout = %q, want both cache confirmations in canonical order", stdout)
+	}
+}
+
+func TestCombinedConformancePreflightsAllRuntimes(t *testing.T) {
+	cacheDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "codex-launched")
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populateRuntimeCache(t, cacheDir, "codex", runtimecache.CodexVersion, "#!/bin/sh\ntouch "+marker+"\nexit 0\n")
+
+	code, stdout, stderr := run(t, "conformance", "codex", "opencode")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want no case output", stdout)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("Codex launched despite an invalid OpenCode prerequisite")
+	}
+	if !strings.Contains(stderr, "learning-loop runtime-setup opencode") {
+		t.Fatalf("stderr = %q, want the exact OpenCode repair command", stderr)
+	}
+}
+
+func TestCombinedConformanceRunsBothAndEmitsCanonicalOrder(t *testing.T) {
+	cacheDir := t.TempDir()
+	codexMarker := filepath.Join(t.TempDir(), "codex-launched")
+	openCodeMarker := filepath.Join(t.TempDir(), "opencode-launched")
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	populateRuntimeCache(t, cacheDir, "codex", runtimecache.CodexVersion, "#!/bin/sh\ntouch "+codexMarker+"\nexit 0\n")
+	populateRuntimeCache(t, cacheDir, "opencode", runtimecache.OpenCodeVersion, "#!/bin/sh\ntouch "+openCodeMarker+"\nexit 0\n")
+
+	code, _, stderr := run(t, "conformance", "opencode", "codex")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want both fake cases to fail their semantic checks")
+	}
+	for _, marker := range []string{codexMarker, openCodeMarker} {
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("case did not launch: %s: %v", marker, err)
+		}
+	}
+	codexAt := strings.Index(stderr, "conformance codex: FAIL")
+	opencodeAt := strings.Index(stderr, "conformance opencode: FAIL")
+	if codexAt < 0 || opencodeAt < 0 || codexAt > opencodeAt {
+		t.Fatalf("stderr = %q, want failures in canonical order", stderr)
+	}
+}
+
+func TestStandaloneAndCombinedKeepRetainState(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", cacheDir)
+	for _, name := range []string{"codex", "opencode"} {
+		version := runtimecache.CodexVersion
+		if name == "opencode" {
+			version = runtimecache.OpenCodeVersion
+		}
+		populateRuntimeCache(t, cacheDir, name, version, "#!/bin/sh\nexit 0\n")
+	}
+
+	code, stdout, stderr := run(t, "conformance", "opencode", "codex", "--keep")
+	if code == 0 {
+		t.Fatalf("exit code = 0, want fake cases to fail semantic checks")
+	}
+	if strings.Count(stdout, "retaining full state at ") != 2 {
+		t.Fatalf("stdout = %q, want both retained-state paths", stdout)
+	}
+	if stderr == "" {
+		t.Fatalf("stderr = %q, want failure bundles", stderr)
+	}
+	for _, line := range strings.Split(stdout, "\n") {
+		if !strings.Contains(line, "retaining full state at ") {
+			continue
+		}
+		path := line[strings.Index(line, "retaining full state at ")+len("retaining full state at "):]
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatalf("remove retained state %q: %v", path, err)
+		}
+	}
+
+	code, stdout, stderr = run(t, "conformance", "codex", "--keep")
+	if code == 0 || !strings.Contains(stdout, "retaining full state at ") || stderr == "" {
+		t.Fatalf("standalone keep: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.Contains(line, "retaining full state at ") {
+			path := line[strings.Index(line, "retaining full state at ")+len("retaining full state at "):]
+			_ = os.RemoveAll(path)
+		}
+	}
+}
+
 func TestConformanceUsageErrors(t *testing.T) {
 	for _, args := range [][]string{
 		{"conformance"}, {"conformance", "bogus"}, {"conformance", "codex", "--bogus"},
-		{"runtime-setup"}, {"runtime-setup", "bogus"},
+		{"conformance", "codex", "opencode", "opencode"}, {"conformance", "codex", "--keep", "opencode"},
+		{"runtime-setup"}, {"runtime-setup", "bogus"}, {"runtime-setup", "codex", "codex"},
 	} {
 		code, stdout, stderr := run(t, args...)
 		if code == 0 {

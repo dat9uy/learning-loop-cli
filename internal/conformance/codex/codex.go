@@ -90,6 +90,10 @@ func (c Case) Launch(ctx context.Context, env *harness.Env) (harness.LaunchResul
 	cmd.Env = append(os.Environ(),
 		"CODEX_HOME="+env.RuntimeHome,
 		"CODEX_SQLITE_HOME="+sqliteHome,
+		"HOME="+filepath.Join(env.WorkDir, "home"),
+		"XDG_CONFIG_HOME="+filepath.Join(env.WorkDir, "config"),
+		"XDG_DATA_HOME="+filepath.Join(env.WorkDir, "data"),
+		"XDG_CACHE_HOME="+filepath.Join(env.WorkDir, "cache"),
 		"OPENAI_API_KEY=dummy",
 		"PATH="+env.Path(),
 	)

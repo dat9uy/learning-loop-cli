@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/dat9uy/learning-loop-cli/internal/pathenv"
 	"github.com/dat9uy/learning-loop-cli/internal/render"
 )
 
@@ -78,6 +79,20 @@ func New() Installer {
 }
 
 func (i *installer) Install(projectRoot string) ([]string, error) {
+	return i.install(projectRoot)
+}
+
+// InstallWithPath is the isolated Installer seam used by the concurrent Test
+// Harness. It resolves both learning-loop and Codex from the supplied PATH
+// without changing the parent process environment.
+func (i *installer) InstallWithPath(projectRoot, path string) ([]string, error) {
+	d := i.deps
+	d.lookPath = func(name string) (string, error) { return pathenv.LookPath(path, name) }
+	d.codexVersion = func() (string, error) { return runCodexVersionWithPath(path) }
+	return (&installer{deps: d}).install(projectRoot)
+}
+
+func (i *installer) install(projectRoot string) ([]string, error) {
 	if err := render.ValidateProjectRoot(projectRoot); err != nil {
 		return nil, err
 	}
@@ -196,9 +211,19 @@ func parseCodexVersion(raw string) string {
 }
 
 func runCodexVersion() (string, error) {
+	return runCodexVersionWithPath(os.Getenv("PATH"))
+}
+
+func runCodexVersionWithPath(path string) (string, error) {
+	resolved, err := pathenv.LookPath(path, "codex")
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "codex", "--version").Output()
+	cmd := exec.CommandContext(ctx, resolved, "--version")
+	cmd.Env = pathenv.WithPath(os.Environ(), path)
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}

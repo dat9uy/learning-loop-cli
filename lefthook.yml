@@ -1,0 +1,3 @@
+pre-push:
+  jobs:
+    - run: learning-loop conformance codex opencode
