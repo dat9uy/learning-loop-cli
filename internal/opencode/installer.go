@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/dat9uy/learning-loop-cli/internal/pathenv"
 	"github.com/dat9uy/learning-loop-cli/internal/render"
 )
 
@@ -62,6 +63,20 @@ func New() Installer {
 }
 
 func (i *installer) Install(projectRoot string) ([]string, error) {
+	return i.install(projectRoot)
+}
+
+// InstallWithPath is the isolated Installer seam used by the concurrent Test
+// Harness. It resolves both learning-loop and OpenCode from the supplied PATH
+// without changing the parent process environment.
+func (i *installer) InstallWithPath(projectRoot, path string) ([]string, error) {
+	d := i.deps
+	d.lookPath = func(name string) (string, error) { return pathenv.LookPath(path, name) }
+	d.opencodeVersion = func() (string, error) { return runOpenCodeVersionWithPath(path) }
+	return (&installer{deps: d}).install(projectRoot)
+}
+
+func (i *installer) install(projectRoot string) ([]string, error) {
 	if err := render.ValidateProjectRoot(projectRoot); err != nil {
 		return nil, err
 	}
@@ -204,9 +219,19 @@ func (i *installer) versionWarning() string {
 }
 
 func runOpenCodeVersion() (string, error) {
+	return runOpenCodeVersionWithPath(os.Getenv("PATH"))
+}
+
+func runOpenCodeVersionWithPath(path string) (string, error) {
+	resolved, err := pathenv.LookPath(path, "opencode")
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "opencode", "--version").Output()
+	cmd := exec.CommandContext(ctx, resolved, "--version")
+	cmd.Env = pathenv.WithPath(os.Environ(), path)
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}

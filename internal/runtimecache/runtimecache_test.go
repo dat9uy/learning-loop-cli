@@ -125,6 +125,38 @@ func TestSetupCodexIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSetupCodexPreservesExistingEntryOnChecksumFailure(t *testing.T) {
+	archive := fakeTarGz(t, "bin/codex", []byte("#!/bin/sh\necho replacement\n"))
+	p := fakePlatform(archive, platform{archive: "codex-package-x86_64-unknown-linux-musl.tar.gz", binary: "bin/codex", kind: archiveTarGz})
+	p.sha256 = strings.Repeat("0", 64)
+	dir := t.TempDir()
+	t.Setenv("LEARNING_LOOP_CACHE", dir)
+	old := []byte("#!/bin/sh\necho existing\n")
+	populate := filepath.Join(dir, "codex-"+CodexVersion)
+	if err := os.MkdirAll(populate, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	bin := filepath.Join(populate, "codex")
+	if err := os.WriteFile(bin, old, 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.WriteFile(bin+".sha256", []byte(strings.Repeat("0", 64)+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile checksum: %v", err)
+	}
+
+	err := setupRuntime("openai/codex", "codex", CodexVersion, codexReleaseTag, deps{
+		platform: func() (platform, error) { return p, nil },
+		download: func(url string) ([]byte, error) { return archive, nil },
+	})
+	if err == nil {
+		t.Fatalf("setupRuntime succeeded with a bad checksum")
+	}
+	got, readErr := os.ReadFile(bin)
+	if readErr != nil || string(got) != string(old) {
+		t.Fatalf("existing cache = %q, %v; want the untouched old entry", got, readErr)
+	}
+}
+
 func TestSetupCodexRejectsChecksumMismatch(t *testing.T) {
 	archive := fakeTarGz(t, "bin/codex", []byte("#!/bin/sh\necho fake codex\n"))
 	p := fakePlatform(archive, platform{archive: "codex-package-x86_64-unknown-linux-musl.tar.gz", binary: "bin/codex", kind: archiveTarGz})

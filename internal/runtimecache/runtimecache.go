@@ -233,18 +233,27 @@ func setupRuntime(repo, name, version, tag string, d deps) error {
 	if err != nil {
 		return err
 	}
-	dir, err := CacheDir()
+	cacheDir, err := CacheDir()
 	if err != nil {
 		return err
 	}
-	target := filepath.Join(dir, runtimeDir(name, version))
+	target := filepath.Join(cacheDir, runtimeDir(name, version))
 	bin := filepath.Join(target, filepath.Base(p.binary))
 	if err := validateBinary(bin); err == nil {
 		return nil
 	}
-	if err := os.MkdirAll(target, 0o755); err != nil {
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return &Error{Code: "E301", Msg: fmt.Sprintf("creating the Runtime cache: %v", err)}
 	}
+
+	// Stage the complete cache entry outside the live path. A failed download,
+	// checksum, extraction, or write therefore cannot damage an existing entry.
+	staging, err := os.MkdirTemp(cacheDir, "."+name+"-staging-")
+	if err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("creating the Runtime cache staging area: %v", err)}
+	}
+	defer os.RemoveAll(staging)
+
 	url := "https://github.com/" + repo + "/releases/download/" + tag + "/" + p.archive
 	archive, err := d.download(url)
 	if err != nil {
@@ -257,8 +266,45 @@ func setupRuntime(repo, name, version, tag string, d deps) error {
 	if err != nil {
 		return &Error{Code: "E301", Msg: fmt.Sprintf("extracting %s from %s: %v", p.binary, p.archive, err)}
 	}
-	if err := writeBinary(target, bin, content); err != nil {
+	stagedBin := filepath.Join(staging, filepath.Base(p.binary))
+	if err := writeBinary(staging, stagedBin, content); err != nil {
 		return err
+	}
+	if err := replaceCacheEntry(target, staging); err != nil {
+		return err
+	}
+	return nil
+}
+
+// replaceCacheEntry swaps a fully written staged directory into the live
+// cache path. The old entry is moved aside first so a replacement failure can
+// be rolled back without exposing a partially written cache entry.
+func replaceCacheEntry(target, staging string) error {
+	parent := filepath.Dir(target)
+	backup, err := os.MkdirTemp(parent, ".cache-backup-")
+	if err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("preparing the Runtime cache replacement: %v", err)}
+	}
+	if err := os.Remove(backup); err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("preparing the Runtime cache replacement: %v", err)}
+	}
+
+	oldMoved := false
+	if err := os.Rename(target, backup); err != nil {
+		if !os.IsNotExist(err) {
+			return &Error{Code: "E301", Msg: fmt.Sprintf("replacing the Runtime cache: %v", err)}
+		}
+	} else {
+		oldMoved = true
+	}
+	if err := os.Rename(staging, target); err != nil {
+		if oldMoved {
+			_ = os.Rename(backup, target)
+		}
+		return &Error{Code: "E301", Msg: fmt.Sprintf("replacing the Runtime cache: %v", err)}
+	}
+	if oldMoved {
+		_ = os.RemoveAll(backup)
 	}
 	return nil
 }

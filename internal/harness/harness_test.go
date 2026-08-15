@@ -160,3 +160,13 @@ func TestBoundedTruncates(t *testing.T) {
 		t.Fatalf("bounded long = %q", got)
 	}
 }
+
+func TestSanitizeRedactsCredentialValues(t *testing.T) {
+	got := sanitize(`{"apiKey":"secret-value","authorization":"Bearer hidden","token":hidden-token}`)
+	if strings.Contains(got, "secret-value") || strings.Contains(got, "hidden") {
+		t.Fatalf("sanitize = %q, leaked a credential", got)
+	}
+	if strings.Count(got, "[REDACTED]") != 3 {
+		t.Fatalf("sanitize = %q, want three redactions", got)
+	}
+}
