@@ -10,12 +10,17 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -29,6 +34,27 @@ const CodexVersion = "0.147.0"
 // OpenCodeVersion is the pinned OpenCode version whose plugin contract the
 // conformance case validates.
 const OpenCodeVersion = "1.18.18"
+
+// PiVersion is the pinned pi version whose extension contract the
+// conformance case validates.
+const PiVersion = "0.84.1"
+
+// PiEntryPoint is the pi CLI entry point inside the cached npm tree,
+// relative to the tree root.
+const PiEntryPoint = "package/dist/cli.js"
+
+// piTarballName returns the npm registry tarball file name of the pinned pi
+// package; the cached copy keeps the same name.
+func piTarballName() string {
+	return "pi-coding-agent-" + PiVersion + ".tgz"
+}
+
+// piTarballURL is the npm registry tarball URL of the pinned pi package.
+var piTarballURL = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/" + piTarballName()
+
+// piIntegrity is the registry-published dist.integrity (sha512) of the
+// pinned pi tarball.
+const piIntegrity = "sha512-ncAqFrG+iybuPGOhMiZoEHkEzTpJgz3guYD32pD+M7ucc0WeHmauP6wa7qwP8V/KWvsZDVNa5XGsdZ7fkC7w7A=="
 
 // codexReleaseTag is the GitHub release tag carrying the pinned Codex CLI.
 const codexReleaseTag = "rust-v0.147.0"
@@ -178,6 +204,23 @@ func OpenCodeBinaryPath() (string, error) {
 	return cachedBinaryPath("opencode", "OpenCode", OpenCodeVersion, openCodePlatforms)
 }
 
+// PiTreePath returns the path of the cached pinned pi CLI entry point,
+// validating that the cached npm tree exists and matches the recorded
+// integrity. It never downloads or installs. When the cached prerequisite
+// is absent or invalid it returns an *Error with the exact setup
+// remediation.
+func PiTreePath() (string, error) {
+	dir, err := CacheDir()
+	if err != nil {
+		return "", err
+	}
+	entryDir := filepath.Join(dir, runtimeDir("pi", PiVersion))
+	if err := validatePiTree(entryDir); err != nil {
+		return "", &Error{Code: "E300", Msg: fmt.Sprintf("cached pi %s is absent or invalid (%v); run `learning-loop runtime-setup pi`", PiVersion, err)}
+	}
+	return filepath.Join(entryDir, PiEntryPoint), nil
+}
+
 // SetupCodex downloads the pinned Codex CLI, verifies its published
 // checksum, and stores it in the development Runtime cache. It is
 // idempotent: an already valid cached binary is left untouched.
@@ -200,6 +243,229 @@ func SetupOpenCode() error {
 		},
 		download: downloadArchive,
 	})
+}
+
+// SetupPi downloads the pinned pi npm package, verifies its registry
+// integrity, extracts it into the development Runtime cache, and installs
+// its shrinkwrap-pinned dependencies so the cached tree is runnable. It is
+// idempotent: an already valid cached tree is left untouched.
+func SetupPi() error {
+	return setupPi(piDeps{
+		download:  downloadArchive,
+		integrity: func(archive []byte) error { return verifyIntegrity(archive, piIntegrity) },
+		install:   npmInstall,
+	})
+}
+
+type piDeps struct {
+	download  func(url string) ([]byte, error)
+	integrity func(archive []byte) error
+	install   func(dir string) error
+}
+
+func setupPi(d piDeps) error {
+	cacheDir, err := CacheDir()
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(cacheDir, runtimeDir("pi", PiVersion))
+	if err := validatePiTree(target); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("creating the Runtime cache: %v", err)}
+	}
+
+	// Stage the complete cache entry outside the live path. A failed download,
+	// integrity check, extraction, or install therefore cannot damage an
+	// existing entry.
+	staging, err := os.MkdirTemp(cacheDir, ".pi-staging-")
+	if err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("creating the Runtime cache staging area: %v", err)}
+	}
+	defer os.RemoveAll(staging)
+
+	archive, err := d.download(piTarballURL)
+	if err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("downloading %s: %v", piTarballURL, err)}
+	}
+	if err := d.integrity(archive); err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("integrity mismatch for %s; refusing to cache it", piTarballName())}
+	}
+	if err := extractTarGzTree(archive, staging); err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("extracting %s: %v", piTarballName(), err)}
+	}
+	// The published pi package is not self-contained: its runtime
+	// dependencies are pinned by the shrinkwrap inside the verified tarball
+	// and installed here once, so conformance never downloads.
+	if err := d.install(filepath.Join(staging, "package")); err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("installing the pinned pi dependencies: %v", err)}
+	}
+	if err := writeIntegrityRecord(staging, piTarballName(), archive); err != nil {
+		return err
+	}
+	if err := replaceCacheEntry(target, staging); err != nil {
+		return err
+	}
+	return nil
+}
+
+// npmInstall installs the production dependencies of the package rooted at
+// dir exactly as pinned by its npm-shrinkwrap.json, without rewriting the
+// lockfile.
+func npmInstall(dir string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "npm", "install", "--omit=dev", "--no-audit", "--no-fund", "--no-package-lock")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if len(msg) > 1024 {
+			msg = msg[:1024] + "... (truncated)"
+		}
+		return fmt.Errorf("npm install: %v: %s", err, msg)
+	}
+	return nil
+}
+
+// verifyIntegrity checks archive against an npm SRI integrity string of the
+// form "sha512-<base64 digest>".
+func verifyIntegrity(archive []byte, integrity string) error {
+	const prefix = "sha512-"
+	if !strings.HasPrefix(integrity, prefix) {
+		return fmt.Errorf("unsupported integrity format %q", integrity)
+	}
+	sum := sha512.Sum512(archive)
+	if base64.StdEncoding.EncodeToString(sum[:]) != strings.TrimPrefix(integrity, prefix) {
+		return fmt.Errorf("integrity mismatch")
+	}
+	return nil
+}
+
+// extractTarGzTree extracts a gzipped tar archive into dir, rejecting any
+// entry that would escape dir.
+func extractTarGzTree(archive []byte, dir string) error {
+	gz, err := gzip.NewReader(bytes.NewReader(archive))
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		name := filepath.Clean(hdr.Name)
+		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) || strings.HasPrefix(name, "../") {
+			return fmt.Errorf("unsafe archive entry %q", hdr.Name)
+		}
+		target := filepath.Join(dir, name)
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return err
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return err
+			}
+		default:
+			// Skip device, fifo, and other special entries; the pinned
+			// package contains only regular files, directories, and links.
+		}
+	}
+}
+
+// writeIntegrityRecord stores the verified tarball and its recorded
+// integrity next to the extracted tree, so later validation can confirm the
+// cached tree derives from the pinned artifact.
+func writeIntegrityRecord(dir, name string, archive []byte) error {
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, archive, 0o644); err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("recording the cached tarball: %v", err)}
+	}
+	sum := sha512.Sum512(archive)
+	record := base64.StdEncoding.EncodeToString(sum[:]) + "\n"
+	if err := os.WriteFile(path+".sha512", []byte(record), 0o644); err != nil {
+		return &Error{Code: "E301", Msg: fmt.Sprintf("recording the cached integrity: %v", err)}
+	}
+	return nil
+}
+
+// validatePiTree checks that the cached pi entry holds the extracted npm
+// tree with its installed dependencies, the verified tarball, and a
+// recorded integrity matching the tarball.
+func validatePiTree(entryDir string) error {
+	entryPoint := filepath.Join(entryDir, PiEntryPoint)
+	info, err := os.Stat(entryPoint)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("entry point is not a regular file")
+	}
+	recorded, err := os.ReadFile(filepath.Join(entryDir, piTarballName()+".sha512"))
+	if err != nil {
+		return fmt.Errorf("missing recorded integrity")
+	}
+	content, err := os.ReadFile(filepath.Join(entryDir, piTarballName()))
+	if err != nil {
+		return err
+	}
+	sum := sha512.Sum512(content)
+	if base64.StdEncoding.EncodeToString(sum[:]) != strings.TrimSpace(string(recorded)) {
+		return fmt.Errorf("integrity mismatch")
+	}
+	if err := validateInstalledDeps(entryDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateInstalledDeps checks that every required dependency of the pinned
+// package is present in the cached tree's node_modules, so the tree is
+// runnable without further downloads. Optional dependencies are excluded
+// because npm may skip them on some platforms.
+func validateInstalledDeps(entryDir string) error {
+	data, err := os.ReadFile(filepath.Join(entryDir, "package", "package.json"))
+	if err != nil {
+		return fmt.Errorf("missing package.json: %v", err)
+	}
+	var pkg struct {
+		Dependencies map[string]string `json:"dependencies"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return fmt.Errorf("parsing package.json: %v", err)
+	}
+	for name := range pkg.Dependencies {
+		if _, err := os.Stat(filepath.Join(entryDir, "package", "node_modules", name)); err != nil {
+			return fmt.Errorf("missing installed dependency %s", name)
+		}
+	}
+	return nil
 }
 
 type deps struct {
