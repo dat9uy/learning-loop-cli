@@ -12,6 +12,7 @@ import (
 	conformanceopencode "github.com/dat9uy/learning-loop-cli/internal/conformance/opencode"
 	"github.com/dat9uy/learning-loop-cli/internal/harness"
 	"github.com/dat9uy/learning-loop-cli/internal/opencode"
+	"github.com/dat9uy/learning-loop-cli/internal/pi"
 	"github.com/dat9uy/learning-loop-cli/internal/recordstore"
 	"github.com/dat9uy/learning-loop-cli/internal/render"
 	"github.com/dat9uy/learning-loop-cli/internal/runtimecache"
@@ -26,6 +27,8 @@ Usage:
   learning-loop disconnect codex <project-root> disconnect the project from Codex
   learning-loop connect opencode <project-root>  connect the project to OpenCode
   learning-loop disconnect opencode <project-root> disconnect the project from OpenCode
+  learning-loop connect pi <project-root>        connect the project to pi
+  learning-loop disconnect pi <project-root>     disconnect the project from pi
   learning-loop codex-adapter                    Codex SessionStart hook adapter (reads stdin)
   learning-loop runtime-setup <codex|opencode> [<codex|opencode>]  download pinned Runtimes into the Runtime cache
   learning-loop conformance <codex|opencode> [<codex|opencode>] [--keep]  run real-Runtime conformance cases
@@ -60,6 +63,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runConnectCodex(args[2], stdout, stderr)
 		case "opencode":
 			return runConnectOpenCode(args[2], stdout, stderr)
+		case "pi":
+			return runConnectPi(args[2], stdout, stderr)
 		default:
 			usageError(stderr)
 			return 2
@@ -74,6 +79,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runDisconnectCodex(args[2], stdout, stderr)
 		case "opencode":
 			return runDisconnectOpenCode(args[2], stdout, stderr)
+		case "pi":
+			return runDisconnectPi(args[2], stdout, stderr)
 		default:
 			usageError(stderr)
 			return 2
@@ -175,6 +182,30 @@ func runDisconnectOpenCode(root string, stdout, stderr io.Writer) int {
 	messages, err := opencode.New().Uninstall(root)
 	if err != nil {
 		fmt.Fprintf(stderr, "learning-loop: disconnect opencode: %v\n", err)
+		return 1
+	}
+	for _, m := range messages {
+		fmt.Fprintln(stdout, m)
+	}
+	return 0
+}
+
+func runConnectPi(root string, stdout, stderr io.Writer) int {
+	messages, err := pi.New().Install(root)
+	if err != nil {
+		fmt.Fprintf(stderr, "learning-loop: connect pi: %v\n", err)
+		return 1
+	}
+	for _, m := range messages {
+		fmt.Fprintln(stdout, m)
+	}
+	return 0
+}
+
+func runDisconnectPi(root string, stdout, stderr io.Writer) int {
+	messages, err := pi.New().Uninstall(root)
+	if err != nil {
+		fmt.Fprintf(stderr, "learning-loop: disconnect pi: %v\n", err)
 		return 1
 	}
 	for _, m := range messages {

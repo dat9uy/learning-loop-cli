@@ -183,7 +183,7 @@ func TestRenderRequiresAbsoluteRoot(t *testing.T) {
 }
 
 func TestUsageErrors(t *testing.T) {
-	for _, args := range [][]string{nil, {"bogus"}, {"render"}, {"init"}, {"connect"}, {"connect", "unknown", "/tmp/x"}, {"disconnect"}, {"disconnect", "unknown", "/tmp/x"}, {"codex-adapter", "extra"}} {
+	for _, args := range [][]string{nil, {"bogus"}, {"render"}, {"init"}, {"connect"}, {"connect", "unknown", "/tmp/x"}, {"connect", "pi"}, {"disconnect"}, {"disconnect", "unknown", "/tmp/x"}, {"disconnect", "pi"}, {"codex-adapter", "extra"}} {
 		code, stdout, stderr := run(t, args...)
 		if code == 0 {
 			t.Fatalf("args %v: exit code = 0, want nonzero", args)
@@ -314,6 +314,100 @@ func TestDisconnectOpenCodeRemovesPlugin(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, ".opencode", "plugins", "learning-loop.js")); !os.IsNotExist(err) {
 		t.Fatalf("learning-loop.js still exists")
+	}
+}
+
+func fakePiPathEnv(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable: %v", err)
+	}
+	if err := os.Symlink(exe, filepath.Join(dir, "learning-loop")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	return dir
+}
+
+func TestConnectPiCreatesExtension(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", fakePiPathEnv(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", t.TempDir())
+	code, stdout, stderr := run(t, "connect", "pi", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "connected pi to "+root) {
+		t.Fatalf("stdout = %q, want connection confirmation", stdout)
+	}
+	if !strings.Contains(stdout, "project trust is pending") {
+		t.Fatalf("stdout = %q, want trust pending report", stdout)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".pi", "extensions", "learning-loop.ts"))
+	if err != nil {
+		t.Fatalf("learning-loop.ts: %v", err)
+	}
+	if !strings.Contains(string(data), `const projectRoot = "`+root+`";`) {
+		t.Fatalf("learning-loop.ts = %q, want embedded project root", data)
+	}
+	if !strings.Contains(string(data), `pi.on("before_agent_start"`) {
+		t.Fatalf("learning-loop.ts = %q, want native before_agent_start handler", data)
+	}
+}
+
+func TestConnectPiSkipsTrustReportWhenAlreadyTrusted(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+	agentDir := filepath.Join(home, ".pi", "agent")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "trust.json"), []byte(fmt.Sprintf(`{%q: true}`, root)), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("PATH", fakePiPathEnv(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", home)
+	code, stdout, stderr := run(t, "connect", "pi", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if strings.Contains(stdout, "project trust is pending") {
+		t.Fatalf("stdout = %q, want no pending report for a trusted project", stdout)
+	}
+}
+
+func TestDisconnectPiRemovesExtension(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", fakePiPathEnv(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", t.TempDir())
+	if code, _, stderr := run(t, "connect", "pi", root); code != 0 {
+		t.Fatalf("connect exit code = %d (stderr: %s)", code, stderr)
+	}
+	code, stdout, stderr := run(t, "disconnect", "pi", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "disconnected pi from "+root) {
+		t.Fatalf("stdout = %q, want disconnection confirmation", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".pi", "extensions", "learning-loop.ts")); !os.IsNotExist(err) {
+		t.Fatalf("learning-loop.ts still exists")
+	}
+}
+
+func TestConnectPiPathMismatchFails(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	code, stdout, stderr := run(t, "connect", "pi", root)
+	if code == 0 {
+		t.Fatalf("exit code = 0, want nonzero")
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "E201") {
+		t.Fatalf("stderr = %q, want stable code E201", stderr)
 	}
 }
 
